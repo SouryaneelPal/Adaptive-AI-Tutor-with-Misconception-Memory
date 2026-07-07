@@ -1,0 +1,433 @@
+"""
+diagnostic_agent.py
+--------------------
+Diagnostic Agent for the Adaptive AI Tutor with Misconception Memory.
+
+Role
+====
+This agent is the first "thinking" step in the tutoring loop. Given a
+student's most recent response, the concept currently being taught, and
+the student's long-term memory profile, it must:
+
+    1. Decide whether the answer is CORRECT or an ERROR.
+    2. If it's an error, classify it as one of:
+         - CARELESS      (slip / typo / arithmetic mistake, concept is fine)
+         - CONCEPTUAL     (student misunderstands the current concept itself)
+         - PREREQUISITE   (the gap traces back to an earlier, foundational skill)
+    3. Name the specific misconception (if any), in student-facing language.
+    4. Recommend an instructional strategy for the downstream Hint Generator
+       agent to execute (e.g., "small_clue", "worked_example",
+       "prerequisite_review").
+
+This module is designed to be used as a single node inside a LangGraph
+`StateGraph`. It reads from and writes to a shared `state: dict`, so it can
+be dropped into `orchestrator.py` with a single `graph.add_node(...)` call.
+
+Tech stack: Python 3.10+, LangChain (ChatOpenAI + structured output),
+Pydantic v2.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from enum import Enum
+from typing import Any, Optional
+
+from dotenv import load_dotenv
+from langchain_core.output_parsers import PydanticOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_ollama import ChatOllama
+from pydantic import BaseModel, Field, field_validator
+
+# --------------------------------------------------------------------------- #
+# Environment & logging setup
+# --------------------------------------------------------------------------- #
+
+load_dotenv()  # Pulls OPENAI_API_KEY, etc. from backend/.env
+
+logger = logging.getLogger("diagnostic_agent")
+logging.basicConfig(level=logging.INFO)
+
+DEFAULT_MODEL = os.getenv("DIAGNOSTIC_AGENT_MODEL", "gemma4:12b")
+DEFAULT_TEMPERATURE = 0.0  # Diagnosis should be deterministic, not creative
+
+
+# --------------------------------------------------------------------------- #
+# Pydantic schemas
+# --------------------------------------------------------------------------- #
+
+class ErrorType(str, Enum):
+    """Classification of a student's error."""
+
+    NONE = "None"                # Answer is correct / no error detected
+    CARELESS = "Careless"        # Slip, typo, arithmetic mistake
+    CONCEPTUAL = "Conceptual"    # Misunderstands the current concept
+    PREREQUISITE = "Prerequisite"  # Gap traces to an earlier foundational skill
+
+
+class InstructionalStrategy(str, Enum):
+    """
+    Strategies the Hint Generator agent knows how to execute.
+    Keeping this as a closed enum (rather than free text) makes the
+    hand-off between agents in the LangGraph state machine reliable.
+    """
+
+    NONE = "none"                              # No intervention needed, answer is correct
+    RETRY_PROMPT = "retry_prompt"               # "Double check your work" - for careless errors
+    SMALL_CLUE = "small_clue"                   # Level 1 of hint ladder
+    STRONGER_HINT = "stronger_hint"              # Level 2 of hint ladder
+    WORKED_EXAMPLE = "worked_example"            # Level 3 of hint ladder
+    PREREQUISITE_REVIEW = "prerequisite_review"  # Detour to reteach a foundational skill
+    ESCALATE_TO_TEACHER = "escalate_to_teacher"  # Repeated/severe gap -> human handoff
+
+
+class DiagnosticResult(BaseModel):
+    """
+    Strict, structured output produced by the Diagnostic Agent.
+    This is what gets written into the shared LangGraph state and consumed
+    by hint_generator.py / escalation_agent.py / misconception_graph.py.
+    """
+
+    is_correct: bool = Field(
+        description="True if the student's response demonstrates the correct answer/understanding."
+    )
+    error_type: ErrorType = Field(
+        description="Category of the error: None, Careless, Conceptual, or Prerequisite."
+    )
+    identified_misconception: Optional[str] = Field(
+        default=None,
+        description=(
+            "A short, specific, student-facing description of the misconception "
+            "(e.g., 'Believes a larger denominator always means a larger fraction'). "
+            "Null if is_correct is True."
+        ),
+    )
+    missing_prerequisite: Optional[str] = Field(
+        default=None,
+        description=(
+            "If error_type is Prerequisite, the name of the earlier concept that "
+            "needs to be reviewed (e.g., 'Comparing unit fractions'). Otherwise null."
+        ),
+    )
+    confidence: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="Model's confidence in this diagnosis, from 0.0 to 1.0.",
+    )
+    reasoning: str = Field(
+        description="One or two sentence explanation of why this classification was chosen."
+    )
+    recommended_strategy: InstructionalStrategy = Field(
+        description="The instructional strategy the Hint Generator agent should execute next."
+    )
+
+    @field_validator("identified_misconception")
+    @classmethod
+    def _blank_to_none(cls, v: Optional[str]) -> Optional[str]:
+        # Normalize empty strings coming back from the LLM to None
+        if v is not None and not v.strip():
+            return None
+        return v
+
+
+# --------------------------------------------------------------------------- #
+# Prompt template
+# --------------------------------------------------------------------------- #
+
+_SYSTEM_PROMPT = """\
+You are the Diagnostic Agent inside an Adaptive AI Tutor. Your ONLY job is to \
+analyze a student's response and produce a precise diagnostic classification. \
+You do NOT teach, hint, or explain the answer to the student — a separate \
+Hint Generator agent handles that using your output.
+
+Classification rules (apply in this order):
+
+1. CORRECT — The student's response is mathematically/conceptually correct \
+   (minor phrasing differences are fine). Set is_correct=true, \
+   error_type="None", recommended_strategy="none".
+
+2. CARELESS — The student clearly knows the underlying concept (their \
+   reasoning, setup, or method is sound) but made a slip: a typo, an \
+   arithmetic slip, mis-copied a number, or a one-off attention error. \
+   There is no evidence of misunderstanding. \
+   recommended_strategy="retry_prompt".
+
+3. CONCEPTUAL — The student's answer reveals a flawed mental model of the \
+   CURRENT concept itself (e.g., for fraction comparison: "1/3 is bigger than \
+   1/2 because 3 is bigger than 2"). The error is systematic, not a slip. \
+   recommended_strategy should follow the hint ladder: use "small_clue" if \
+   this is the student's first or second miss on this concept (check \
+   student_memory_profile), "stronger_hint" if they have missed it before, \
+   or "worked_example" if they have persistently struggled (3+ prior misses \
+   on this concept per the memory profile).
+
+4. PREREQUISITE — The error cannot be fixed by re-explaining the current \
+   concept alone, because it depends on a more foundational skill the \
+   student has not mastered (check student_memory_profile's weak/low-mastery \
+   prerequisites, and infer new ones from the response if needed). \
+   Set missing_prerequisite to the name of that foundational skill. \
+   recommended_strategy="prerequisite_review".
+
+Escalation override: regardless of the above, if student_memory_profile shows \
+a long streak of repeated failures on this exact concept (e.g., \
+consecutive_misses >= 4) or explicit signals of distress/frustration in the \
+response, set recommended_strategy="escalate_to_teacher" instead, while still \
+reporting the correct error_type and misconception.
+
+Be conservative: only claim CONCEPTUAL or PREREQUISITE if the response gives \
+clear evidence. If you are unsure between Careless and Conceptual, prefer \
+Careless and lower your confidence score.
+
+You MUST respond using the exact structured schema you are given. Do not add \
+any extra commentary outside the schema fields.
+
+{format_instructions}
+"""
+
+_HUMAN_PROMPT = """\
+Current concept being taught: {current_concept}
+
+Student's memory profile (mastery levels, known weak prerequisites, and \
+recent history for this concept):
+{student_memory_profile}
+
+Student's most recent response:
+\"\"\"{student_response}\"\"\"
+
+Diagnose this response now.
+"""
+
+
+def _build_prompt(parser: PydanticOutputParser) -> ChatPromptTemplate:
+    """Builds the chat prompt template with format instructions baked in."""
+    return ChatPromptTemplate.from_messages(
+        [
+            ("system", _SYSTEM_PROMPT),
+            ("human", _HUMAN_PROMPT),
+        ]
+    ).partial(format_instructions=parser.get_format_instructions())
+
+
+# --------------------------------------------------------------------------- #
+# Core agent logic
+# --------------------------------------------------------------------------- #
+
+class DiagnosticAgent:
+    """
+    Thin wrapper around an LLM + prompt + parser that performs one diagnosis.
+    Instantiate once (e.g., in orchestrator.py) and reuse across turns to
+    avoid rebuilding the chain every call.
+    """
+
+    def __init__(
+        self,
+        model: str = DEFAULT_MODEL,
+        temperature: float = DEFAULT_TEMPERATURE,
+    ) -> None:
+        self.parser = PydanticOutputParser(pydantic_object=DiagnosticResult)
+        self.prompt = _build_prompt(self.parser)
+
+        # `with_structured_output` gives us native tool-calling based
+        # structured output when available (more reliable than pure text
+        # parsing), while the PydanticOutputParser above still supplies
+        # human-readable format instructions inside the prompt as a
+        # belt-and-suspenders fallback.
+        llm = ChatOllama(
+            model=model, 
+            temperature=temperature,
+            format="json"  # Forces the local model to output valid JSON
+        )
+        
+        self.structured_llm = llm.with_structured_output(DiagnosticResult)
+        self.chain = self.prompt | self.structured_llm
+
+    def diagnose(
+        self,
+        student_response: str,
+        current_concept: str,
+        student_memory_profile: dict[str, Any],
+    ) -> DiagnosticResult:
+        """
+        Run the diagnostic classification for a single student turn.
+
+        Args:
+            student_response: Raw text of the student's latest answer.
+            current_concept: The topic currently being taught, e.g. "Fraction Addition".
+            student_memory_profile: Dict describing concept mastery / known
+                weak prerequisites / recent attempt history for this student.
+
+        Returns:
+            A validated DiagnosticResult.
+        """
+        try:
+            result: DiagnosticResult = self.chain.invoke(
+                {
+                    "student_response": student_response,
+                    "current_concept": current_concept,
+                    "student_memory_profile": json.dumps(
+                        student_memory_profile, indent=2
+                    ),
+                }
+            )
+            return result
+        except Exception as exc:  # noqa: BLE001 - we want a safe fallback for any LLM/parse failure
+            logger.exception("Diagnostic agent failed to produce structured output: %s", exc)
+            # Fail-safe fallback: never crash the orchestrator graph. Default
+            # to a low-confidence conceptual diagnosis and let a human-ish
+            # downstream default (small_clue) handle it gently.
+            return DiagnosticResult(
+                is_correct=False,
+                error_type=ErrorType.CONCEPTUAL,
+                identified_misconception=None,
+                missing_prerequisite=None,
+                confidence=0.0,
+                reasoning=(
+                    "Diagnostic agent encountered an internal error and could not "
+                    "confidently classify this response; defaulting to a cautious hint."
+                ),
+                recommended_strategy=InstructionalStrategy.SMALL_CLUE,
+            )
+
+
+# Module-level singleton so LangGraph nodes don't re-instantiate the LLM
+# client on every invocation. orchestrator.py can still create its own
+# DiagnosticAgent(...) instance if it needs a different model/temperature.
+_default_agent: Optional[DiagnosticAgent] = None
+
+
+def _get_default_agent() -> DiagnosticAgent:
+    global _default_agent
+    if _default_agent is None:
+        _default_agent = DiagnosticAgent()
+    return _default_agent
+
+
+# --------------------------------------------------------------------------- #
+# LangGraph node entry point
+# --------------------------------------------------------------------------- #
+
+def run_diagnostic(state: dict) -> dict:
+    """
+    LangGraph node function.
+
+    Expected keys read from `state`:
+        - "student_response" (str): required
+        - "current_concept" (str): required
+        - "student_memory_profile" (dict): optional, defaults to {}
+
+    Keys written back into `state`:
+        - "diagnostic_result" (dict): the DiagnosticResult, JSON-serializable,
+          for easy consumption by downstream nodes / the Streamlit frontend.
+        - "error_type" (str): convenience top-level copy, used by the
+          orchestrator's conditional routing edges (e.g.,
+          `graph.add_conditional_edges("diagnostic", route_on_error_type, ...)`)
+        - "recommended_strategy" (str): convenience top-level copy, consumed
+          directly by hint_generator.py.
+
+    Returns:
+        The updated state dict (LangGraph merges this back into the graph's
+        shared state).
+    """
+    student_response = state.get("student_response")
+    current_concept = state.get("current_concept")
+    student_memory_profile = state.get("student_memory_profile", {}) or {}
+
+    if not student_response or not current_concept:
+        raise ValueError(
+            "run_diagnostic requires 'student_response' and 'current_concept' "
+            "to be present in state."
+        )
+
+    agent = _get_default_agent()
+    result = agent.diagnose(
+        student_response=student_response,
+        current_concept=current_concept,
+        student_memory_profile=student_memory_profile,
+    )
+
+    logger.info(
+        "Diagnosis for concept=%r -> error_type=%s, strategy=%s, confidence=%.2f",
+        current_concept,
+        result.error_type.value,
+        result.recommended_strategy.value,
+        result.confidence,
+    )
+
+    state["diagnostic_result"] = result.model_dump()
+    state["error_type"] = result.error_type.value
+    state["recommended_strategy"] = result.recommended_strategy.value
+    return state
+
+
+# --------------------------------------------------------------------------- #
+# Mock execution block for standalone testing
+# --------------------------------------------------------------------------- #
+
+if __name__ == "__main__":
+    """
+    Run this file directly to sanity-check the agent before wiring it into
+    orchestrator.py:
+
+        $ python backend/agents/diagnostic_agent.py
+
+    Requires OPENAI_API_KEY to be set (via .env or environment).
+    """
+
+    mock_memory_profile = {
+        "student_id": "stu_1024",
+        "concept_mastery": {
+            "Fraction Addition": {"mastery": 0.42, "consecutive_misses": 1},
+            "Comparing Unit Fractions": {"mastery": 0.31, "consecutive_misses": 2},
+        },
+        "weak_prerequisites": ["Comparing Unit Fractions", "Common Denominators"],
+        "recent_attempts": [
+            {"concept": "Fraction Addition", "correct": False},
+        ],
+    }
+
+    test_cases = [
+        {
+            "label": "Prerequisite gap example",
+            "student_response": "1/2 + 1/3 = 2/5 because you just add the tops and add the bottoms.",
+            "current_concept": "Fraction Addition",
+        },
+        {
+            "label": "Careless slip example",
+            "student_response": (
+                "To add 1/4 + 1/4 I need a common denominator, which is 4. "
+                "So it's 1/4 + 1/4 = 2/8."
+            ),
+            "current_concept": "Fraction Addition",
+        },
+        {
+            "label": "Correct answer example",
+            "student_response": "1/2 + 1/4 = 2/4 + 1/4 = 3/4.",
+            "current_concept": "Fraction Addition",
+        },
+    ]
+
+    diagnostic_agent = DiagnosticAgent()
+
+    for case in test_cases:
+        print("=" * 80)
+        print(f"TEST CASE: {case['label']}")
+        print(f"Student response: {case['student_response']!r}")
+
+        fake_state = {
+            "student_response": case["student_response"],
+            "current_concept": case["current_concept"],
+            "student_memory_profile": mock_memory_profile,
+        }
+
+        try:
+            updated_state = run_diagnostic(fake_state)
+            print(json.dumps(updated_state["diagnostic_result"], indent=2))
+        except Exception as e:  # noqa: BLE001
+            print(f"ERROR running diagnostic node: {e}")
+
+    print("=" * 80)
+    print("Done. If OPENAI_API_KEY was not set, the calls above should have")
+    print("raised an authentication error rather than hanging silently.")
+    #test
