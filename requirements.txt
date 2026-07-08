@@ -1,7 +1,11 @@
 pandas
 langgraph
+langchain
+langchain-core
 langchain-ollama
-python-dotenv 
-langchain-core 
-pydantic 
-backend-ai-agent
+python-dotenv
+pydantic
+streamlit
+sqlalchemy
+pymysql
+ollama
