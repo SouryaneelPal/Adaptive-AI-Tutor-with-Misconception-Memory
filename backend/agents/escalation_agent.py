@@ -54,7 +54,7 @@ logging.basicConfig(level=logging.INFO)
 
 # Local inference via Ollama, matching hint_generator.py's setup so both
 # agents can share one running Ollama instance.
-DEFAULT_MODEL = os.getenv("ESCALATION_AGENT_MODEL", "gemma4:12b")
+DEFAULT_MODEL = os.getenv("ESCALATION_AGENT_MODEL", "gemma4:e4b")
 DEFAULT_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 DEFAULT_TEMPERATURE = float(os.getenv("ESCALATION_AGENT_TEMPERATURE", "0.3"))
 

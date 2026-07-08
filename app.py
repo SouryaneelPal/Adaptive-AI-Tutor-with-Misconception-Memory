@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as st_pandas
 import datetime
 
+from backend.agents.orchestrator import tutor_app
+
 # --- Page Configuration ---
 st.set_page_config(page_title="Adaptive AI Tutor", layout="wide")
 st.title("🧠 Adaptive AI Tutor with Misconception Memory")
@@ -24,7 +26,13 @@ with tab_student:
     # Simulating Flowchart Step 3 & 4: Profile Check & Misconception
     with st.sidebar:
         st.subheader("Student Profile (Hidden from student in prod)")
-        st.info("**Current Topic:** Fractions\n\n**Known Weakness:** Division logic")
+        current_concept = st.text_input(
+            "Current Topic",
+            value="Fractions",
+            placeholder="e.g. Probability, Fractions, Algebra...",
+            help="Set the concept the student is currently studying.",
+        )
+        st.info(f"**Current Topic:** {current_concept}\n\n**Known Weakness:** Division logic")
         st.success("**Confidence Score:** Moderate")
 
     # Chat Interface
@@ -42,13 +50,24 @@ with tab_student:
             with st.chat_message("user"):
                 st.markdown(prompt)
 
-        # Flowchart Step 2 & 5: Diagnostic & Tutor Plan (Simulated AI Response)
-        # Notice it gives a hint, not a direct answer.
-        tutor_response = (
-            "That's a great question! Let's think about a pizza. 🍕 \n\n"
-            "If you cut a pizza into 2 equal slices, and another identical pizza into 3 equal slices, "
-            "which slice would be larger? What happens to the size of the pieces as you make more cuts?"
-        )
+        # Flowchart Step 2 & 5: Diagnostic & Tutor Plan — call the real orchestrator
+        with st.spinner("Thinking..."):
+            try:
+                initial_state = {
+                    "current_question": prompt,
+                    "current_concept": current_concept,
+                    "student_response": prompt,
+                    "student_memory_profile": {},
+                }
+                final_state = tutor_app.invoke(initial_state)
+                tutor_response = (
+                    final_state.get("hint_text")
+                    or final_state.get("teacher_summary")
+                    or "I'm not sure how to respond to that — could you rephrase?"
+                )
+            except Exception as exc:
+                tutor_response = f"⚠️ Tutor error: {exc}"
+
         st.session_state.messages.append({"role": "assistant", "content": tutor_response})
         with chat_container:
             with st.chat_message("assistant"):

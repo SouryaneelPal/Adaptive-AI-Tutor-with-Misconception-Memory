@@ -50,7 +50,7 @@ load_dotenv()  # Pulls OPENAI_API_KEY, etc. from backend/.env
 logger = logging.getLogger("diagnostic_agent")
 logging.basicConfig(level=logging.INFO)
 
-DEFAULT_MODEL = os.getenv("DIAGNOSTIC_AGENT_MODEL", "gemma4:12b")
+DEFAULT_MODEL = os.getenv("DIAGNOSTIC_AGENT_MODEL", "gemma4:e4b")
 DEFAULT_TEMPERATURE = 0.0  # Diagnosis should be deterministic, not creative
 
 
