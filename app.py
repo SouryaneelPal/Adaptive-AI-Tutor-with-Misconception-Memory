@@ -63,14 +63,29 @@ if "escalation_log" not in st.session_state:
 # =====================================================================
 # SIDEBAR — session controls + internals toggle
 # =====================================================================
+_CURRICULUM_TOPICS = [
+    "Fractions",
+    "Probability",
+    "Algebra",
+    "Geometry",
+    "Decimals and Percentages",
+    "Other (custom)",
+]
+
 with st.sidebar:
     st.subheader("⚙️ Session")
-    current_concept = st.text_input(
+    topic_choice = st.selectbox(
         "Current Topic",
-        value="Fractions",
-        placeholder="e.g. Probability, Fractions, Algebra...",
-        help="Set the concept the student is currently studying.",
+        _CURRICULUM_TOPICS,
+        help="Select the concept being studied. RAG retrieves curriculum context for the first 5 topics.",
     )
+    if topic_choice == "Other (custom)":
+        current_concept = st.text_input(
+            "Enter topic name",
+            placeholder="e.g. Trigonometry, Statistics…",
+        )
+    else:
+        current_concept = topic_choice
 
     show_internals = st.toggle(
         "🔬 Show tutor internals",
