@@ -5,30 +5,36 @@ Tutor Planner Agent for the Adaptive AI Tutor with Misconception Memory.
 
 Role
 ====
-Third node in the tutoring loop, downstream of both the Diagnostic Agent
-and the Evaluator Agent. It receives:
-  - The diagnostic classification (error type, misconception, strategy)
-  - The evaluator's quality/confidence assessment
+This agent has two distinct entry points, both reached via
+orchestrator.py's routers:
 
-And decides:
-  1. Which hint-ladder level to use (or whether to generate a practice question)
-  2. What the actual student-facing text should be (hint, worked example, etc.)
+  1. PRAISE MODE (plan_praise) — reached directly from route_after_evaluation
+     when the Evaluator scored the response correct + confident (>= 0.6). No
+     Diagnostic Agent runs on this path, so there's no diagnostic_result to
+     read. This mode writes a short positive reinforcement AND a required
+     next practice_question, so the student keeps progressing.
 
-This is the "curriculum designer" agent: it knows both WHAT is wrong (from
-the Diagnostic) and HOW confidently the student holds their answer (from the
-Evaluator), giving it richer context to calibrate the tutoring response.
+  2. HINT-LADDER MODE (plan) — reached after the Diagnostic Agent, using
+     BOTH its error classification and the Evaluator's quality/confidence
+     assessment to calibrate a hint response.
+
+run_tutor_planner (the LangGraph node) branches between the two based on
+whether "diagnostic_result" is present in state.
 
 Hard pedagogical rule: NEVER reveal the direct final answer to current_question.
 
 Hint Ladder (driven by diagnostic_result.recommended_strategy, calibrated by
 evaluator confidence):
     - none               -> correct + confident: short positive reinforcement
+                            (praise mode also uses this strategy value, plus
+                            a required next practice_question)
     - retry_prompt       -> careless slip: gentle "double-check" nudge
     - small_clue         -> conceptual, first/second miss: guiding question
     - stronger_hint      -> conceptual, repeated miss OR low-confidence correct
     - worked_example     -> persistent struggle: full worked similar example
     - prerequisite_review-> missing foundational skill: reteach prerequisite
-    - escalate_to_teacher-> handled without LLM call (routed before this node)
+    - escalate_to_teacher-> handled without LLM call (orchestrator's escalation
+                            gate routes to escalator_node before this agent runs)
 
 Tech stack: Python 3.10+, LangChain, Ollama (ChatOllama), Pydantic v2.
 """
@@ -216,6 +222,62 @@ def _build_prompt(parser: PydanticOutputParser) -> ChatPromptTemplate:
 
 
 # --------------------------------------------------------------------------- #
+# Praise-mode prompt template (correct + confident path, no diagnostic_result)
+# --------------------------------------------------------------------------- #
+
+_PRAISE_SYSTEM_PROMPT = """\
+You are the Tutor Planner Agent inside an Adaptive AI Tutor. The student just \
+answered CORRECTLY and CONFIDENTLY (per the Evaluator Agent) — no diagnostic \
+classification was needed. Your job here is simple: affirm the student and \
+keep them moving forward.
+
+Produce:
+
+- `hint_text`: 1-2 warm, specific sentences of positive reinforcement. Call \
+  out what they did right (e.g., the specific step or reasoning), not just \
+  generic praise like "Good job!".
+- `applied_strategy`: always "none".
+- `practice_question`: REQUIRED (never null). A new question on the SAME \
+  concept, at the same difficulty or one small step harder than \
+  current_question, so the student keeps progressing. Must be a complete, \
+  answerable question, not a hint about one.
+- `escalation_flag`: always false.
+
+Use `student_memory_profile` for tone only (never mention it explicitly).
+
+Respond ONLY with the structured JSON schema. No prose outside JSON.
+
+CRITICAL: Return raw JSON only — no markdown code blocks, no preamble.
+
+{format_instructions}
+"""
+
+_PRAISE_HUMAN_PROMPT = """\
+Current concept being taught: {current_concept}
+
+Current question the student just solved:
+\"\"\"{current_question}\"\"\"
+
+Student's response:
+\"\"\"{student_response}\"\"\"
+
+Evaluator Agent result:
+{evaluator_result}
+
+Student memory profile (tone calibration only):
+{student_memory_profile}
+
+Generate the praise + next practice question now.
+"""
+
+
+def _build_praise_prompt(parser: PydanticOutputParser) -> ChatPromptTemplate:
+    return ChatPromptTemplate.from_messages(
+        [("system", _PRAISE_SYSTEM_PROMPT), ("human", _PRAISE_HUMAN_PROMPT)]
+    ).partial(format_instructions=parser.get_format_instructions())
+
+
+# --------------------------------------------------------------------------- #
 # Answer-leak guard
 # --------------------------------------------------------------------------- #
 
@@ -246,6 +308,7 @@ class TutorPlannerAgent:
     ) -> None:
         self.parser = PydanticOutputParser(pydantic_object=TutorPlanResult)
         self.prompt = _build_prompt(self.parser)
+        self.praise_prompt = _build_praise_prompt(self.parser)
         self.llm = ChatOllama(
             model=model,
             base_url=base_url,
@@ -253,6 +316,44 @@ class TutorPlannerAgent:
             format="json",
         )
         self.chain = self.prompt | self.llm | self.parser
+        self.praise_chain = self.praise_prompt | self.llm | self.parser
+
+    def plan_praise(
+        self,
+        student_response: str,
+        current_question: str,
+        current_concept: str,
+        evaluator_result: dict[str, Any],
+        student_memory_profile: dict[str, Any],
+    ) -> TutorPlanResult:
+        """
+        Praise-mode planning: correct + confident answer, no diagnostic_result
+        available. Produces warm reinforcement plus a required next
+        practice_question so the student keeps progressing.
+        """
+        try:
+            result: TutorPlanResult = self.praise_chain.invoke(
+                {
+                    "student_response": student_response,
+                    "current_question": current_question,
+                    "current_concept": current_concept,
+                    "evaluator_result": json.dumps(evaluator_result, indent=2),
+                    "student_memory_profile": json.dumps(student_memory_profile, indent=2),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Tutor planner (praise mode) failed: %s", exc)
+            return TutorPlanResult(
+                hint_text="Nice work — that's correct! Ready to try another one?",
+                applied_strategy=InstructionalStrategy.NONE,
+                practice_question=None,
+                escalation_flag=False,
+            )
+
+        if not result.practice_question:
+            logger.warning("Praise-mode planner did not produce a practice_question.")
+
+        return result
 
     def plan(
         self,
@@ -341,13 +442,17 @@ def _get_default_planner() -> TutorPlannerAgent:
 
 def run_tutor_planner(state: dict) -> dict:
     """
-    LangGraph node function. Runs after evaluator_node.
+    LangGraph node function, reached from two different edges:
+      - Directly from evaluator_node (route_after_evaluation: correct +
+        confident) -> no "diagnostic_result" in state -> praise mode.
+      - From diagnostic_node (route_after_diagnosis: not escalated) ->
+        "diagnostic_result" present in state -> hint-ladder mode.
 
     Reads from state:
         - "student_response" (str): required
         - "current_question" (str): required
         - "current_concept" (str): required
-        - "diagnostic_result" (dict): required
+        - "diagnostic_result" (dict): optional — presence selects the mode
         - "evaluator_result" (dict): required (from run_evaluator)
         - "student_memory_profile" (dict): optional
 
@@ -360,7 +465,7 @@ def run_tutor_planner(state: dict) -> dict:
     student_response = state.get("student_response")
     current_question = state.get("current_question")
     current_concept = state.get("current_concept")
-    diagnostic_result = state.get("diagnostic_result", {}) or {}
+    diagnostic_result = state.get("diagnostic_result")
     evaluator_result = state.get("evaluator_result", {}) or {}
     student_memory_profile = state.get("student_memory_profile", {}) or {}
 
@@ -371,14 +476,24 @@ def run_tutor_planner(state: dict) -> dict:
         )
 
     planner = _get_default_planner()
-    result = planner.plan(
-        student_response=student_response,
-        current_question=current_question,
-        current_concept=current_concept,
-        diagnostic_result=diagnostic_result,
-        evaluator_result=evaluator_result,
-        student_memory_profile=student_memory_profile,
-    )
+
+    if diagnostic_result is None:
+        result = planner.plan_praise(
+            student_response=student_response,
+            current_question=current_question,
+            current_concept=current_concept,
+            evaluator_result=evaluator_result,
+            student_memory_profile=student_memory_profile,
+        )
+    else:
+        result = planner.plan(
+            student_response=student_response,
+            current_question=current_question,
+            current_concept=current_concept,
+            diagnostic_result=diagnostic_result,
+            evaluator_result=evaluator_result,
+            student_memory_profile=student_memory_profile,
+        )
 
     logger.info(
         "Tutor plan -> strategy=%s, escalation_flag=%s, has_practice_q=%s",
@@ -454,6 +569,20 @@ if __name__ == "__main__":
             },
             "student_response": "Maybe 5/6? I think I did it right but I'm not sure.",
         },
+        {
+            "label": "Praise mode: correct + confident, no diagnostic_result",
+            "diagnostic_result": None,
+            "evaluator_result": {
+                "answer_quality": "correct",
+                "quality_reasoning": "Correctly converted to a common denominator and added.",
+                "confidence_score": 0.9,
+                "confidence_reasoning": "Direct, confident phrasing with no hedging.",
+                "mastery_signal": True,
+                "distress_detected": False,
+                "distress_reasoning": "No frustration language.",
+            },
+            "student_response": "1/2 + 1/3 = 3/6 + 2/6 = 5/6.",
+        },
     ]
 
     for case in test_cases:
@@ -465,10 +594,11 @@ if __name__ == "__main__":
             "student_response": case["student_response"],
             "current_question": "What is 1/2 + 1/3?",
             "current_concept": "Fraction Addition",
-            "diagnostic_result": case["diagnostic_result"],
             "evaluator_result": case["evaluator_result"],
             "student_memory_profile": mock_memory,
         }
+        if case["diagnostic_result"] is not None:
+            fake_state["diagnostic_result"] = case["diagnostic_result"]
 
         try:
             updated = run_tutor_planner(fake_state)

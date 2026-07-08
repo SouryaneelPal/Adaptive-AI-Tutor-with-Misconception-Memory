@@ -5,13 +5,12 @@ Evaluator Agent for the Adaptive AI Tutor with Misconception Memory.
 
 Role
 ====
-Runs immediately after the Diagnostic Agent and before the Tutor Planner.
-While the Diagnostic Agent classifies the *type* of error, the Evaluator
-produces two orthogonal signals that the Tutor Planner needs to calibrate
-its response:
+Runs FIRST in the tutoring graph, before the Diagnostic Agent. It produces
+the signals the orchestrator's routers need to decide whether the student
+even needs diagnosis:
 
     1. answer_quality  — a clean "correct / partially_correct / incorrect"
-       verdict with a short reasoning note, independent of error type.
+       verdict with a short reasoning note.
 
     2. confidence_score — 0.0–1.0, inferred from the student's linguistic
        hedges ("I think", "maybe", "not sure") vs confident assertions.
@@ -22,9 +21,14 @@ its response:
        updating long-term mastery (e.g., correct + high confidence). The
        memory-update node reads this to decide whether to increment mastery.
 
-This module is a single LangGraph node. It reads the shared state written
-by diagnostic_agent.py's run_diagnostic node, enriches it, and passes it
-forward to tutor_planner.py's run_tutor_planner node.
+    4. distress_detected — True if the response shows frustration,
+       disengagement, or "giving up" language. Combined with the student's
+       consecutive-miss streak, this drives the orchestrator's escalation
+       gate (route_after_diagnosis) without needing an extra LLM call.
+
+route_after_evaluation (in orchestrator.py) reads answer_quality +
+confidence_score to decide: correct + confident -> straight to the Tutor
+Planner's praise mode; otherwise -> the Diagnostic Agent.
 
 Tech stack: Python 3.10+, LangChain, Ollama (ChatOllama), Pydantic v2.
 """
@@ -108,6 +112,19 @@ class EvaluatorResult(BaseModel):
             "confidence_score >= 0.6. False otherwise."
         )
     )
+    distress_detected: bool = Field(
+        default=False,
+        description=(
+            "True if the response shows frustration, disengagement, or "
+            "'giving up' language (e.g., 'I give up', 'I hate this', "
+            "'this is impossible'). False for normal/neutral responses, "
+            "even if incorrect."
+        ),
+    )
+    distress_reasoning: str = Field(
+        default="",
+        description="One sentence explaining the distress_detected verdict.",
+    )
 
     @field_validator("answer_quality", mode="before")
     @classmethod
@@ -126,7 +143,7 @@ class EvaluatorResult(BaseModel):
         except (TypeError, ValueError):
             return 0.5
 
-    @field_validator("mastery_signal", mode="before")
+    @field_validator("mastery_signal", "distress_detected", mode="before")
     @classmethod
     def _coerce_bool(cls, v: Any) -> bool:
         if isinstance(v, bool):
@@ -141,17 +158,16 @@ class EvaluatorResult(BaseModel):
 # --------------------------------------------------------------------------- #
 
 _SYSTEM_PROMPT = """\
-You are the Evaluator Agent inside an Adaptive AI Tutor. Your ONLY job is to \
-assess the QUALITY and CONFIDENCE of the student's response. You do NOT teach, \
-hint, or decide what to do next — a separate Tutor Planner agent handles that.
+You are the Evaluator Agent inside an Adaptive AI Tutor. You run FIRST, before \
+any other agent — your job is to assess the QUALITY, CONFIDENCE, and emotional \
+state of the student's response. You do NOT teach, hint, classify error types, \
+or decide what to do next — separate Diagnostic and Tutor Planner agents handle \
+that, using your output as input.
 
 You receive:
 - `current_question`: the problem the student is solving.
 - `current_concept`: the concept being taught.
 - `student_response`: what the student wrote.
-- `diagnostic_result`: how a Diagnostic Agent already classified the error \
-  type (use this as additional context, but form your own quality/confidence \
-  judgements from the raw student_response).
 
 Your outputs:
 
@@ -175,6 +191,14 @@ Your outputs:
 5. `mastery_signal` — true ONLY when answer_quality == "correct" AND \
    confidence_score >= 0.6. False otherwise.
 
+6. `distress_detected` — true if the response shows frustration, disengagement, \
+   or "giving up" language (e.g., "I give up", "I hate this", "this is \
+   impossible", "I don't get it and never will"). False for a normal wrong \
+   answer, hedging, or confusion that doesn't rise to distress — being unsure \
+   is NOT distress.
+
+7. `distress_reasoning` — 1 sentence explaining the distress_detected verdict.
+
 Respond ONLY with the structured JSON schema. No prose outside JSON.
 
 CRITICAL: Return raw JSON only — no markdown code blocks, no preamble.
@@ -190,9 +214,6 @@ Current question the student is solving:
 
 Student's most recent response:
 \"\"\"{student_response}\"\"\"
-
-Diagnostic Agent result (for additional context):
-{diagnostic_result}
 
 Evaluate the response now.
 """
@@ -235,7 +256,6 @@ class EvaluatorAgent:
         student_response: str,
         current_question: str,
         current_concept: str,
-        diagnostic_result: dict[str, Any],
     ) -> EvaluatorResult:
         try:
             result: EvaluatorResult = self.chain.invoke(
@@ -243,7 +263,6 @@ class EvaluatorAgent:
                     "student_response": student_response,
                     "current_question": current_question,
                     "current_concept": current_concept,
-                    "diagnostic_result": json.dumps(diagnostic_result, indent=2),
                 }
             )
             return result
@@ -255,6 +274,8 @@ class EvaluatorAgent:
                 confidence_score=0.5,
                 confidence_reasoning="Could not assess confidence due to evaluation error.",
                 mastery_signal=False,
+                distress_detected=False,
+                distress_reasoning="Could not assess distress due to evaluation error.",
             )
 
 
@@ -274,24 +295,24 @@ def _get_default_evaluator() -> EvaluatorAgent:
 
 def run_evaluator(state: dict) -> dict:
     """
-    LangGraph node function. Runs after diagnostic_node, before tutor_planner_node.
+    LangGraph node function. Runs FIRST in the graph, before diagnostic_node.
 
     Reads from state:
         - "student_response" (str): required
         - "current_question" (str): required
         - "current_concept" (str): required
-        - "diagnostic_result" (dict): required (from run_diagnostic)
 
     Writes to state:
         - "evaluator_result" (dict): full EvaluatorResult as JSON-serializable dict
         - "answer_quality" (str): "correct" | "partially_correct" | "incorrect"
         - "confidence_score" (float): 0.0–1.0
         - "mastery_signal" (bool): positive mastery evidence flag
+        - "distress_detected" (bool): frustration/disengagement flag, read by
+          the orchestrator's escalation gate (route_after_diagnosis)
     """
     student_response = state.get("student_response")
     current_question = state.get("current_question")
     current_concept = state.get("current_concept")
-    diagnostic_result = state.get("diagnostic_result", {}) or {}
 
     if not student_response or not current_question or not current_concept:
         raise ValueError(
@@ -304,18 +325,19 @@ def run_evaluator(state: dict) -> dict:
         student_response=student_response,
         current_question=current_question,
         current_concept=current_concept,
-        diagnostic_result=diagnostic_result,
     )
 
     logger.info(
-        "Evaluation -> quality=%s, confidence=%.2f, mastery_signal=%s",
+        "Evaluation -> quality=%s, confidence=%.2f, mastery_signal=%s, distress=%s",
         result.answer_quality.value,
         result.confidence_score,
         result.mastery_signal,
+        result.distress_detected,
     )
 
     state["evaluator_result"] = result.model_dump()
     state["answer_quality"] = result.answer_quality.value
+    state["distress_detected"] = result.distress_detected
     state["confidence_score"] = result.confidence_score
     state["mastery_signal"] = result.mastery_signal
     return state
@@ -330,16 +352,6 @@ if __name__ == "__main__":
     $ ollama serve
     $ python backend/agents/evaluator_agent.py
     """
-
-    mock_diagnostic = {
-        "is_correct": False,
-        "error_type": "Conceptual",
-        "identified_misconception": "Adds numerators and denominators directly.",
-        "missing_prerequisite": None,
-        "confidence": 0.85,
-        "reasoning": "Student applied whole-number addition rules to fractions.",
-        "recommended_strategy": "small_clue",
-    }
 
     test_cases = [
         {
@@ -366,6 +378,12 @@ if __name__ == "__main__":
             "current_question": "What is 1/2 + 1/3?",
             "current_concept": "Fraction Addition",
         },
+        {
+            "label": "Distress language (distress_detected should be True)",
+            "student_response": "I give up, I hate fractions, this is impossible.",
+            "current_question": "What is 1/2 + 1/3?",
+            "current_concept": "Fraction Addition",
+        },
     ]
 
     agent = EvaluatorAgent()
@@ -379,7 +397,6 @@ if __name__ == "__main__":
             "student_response": case["student_response"],
             "current_question": case["current_question"],
             "current_concept": case["current_concept"],
-            "diagnostic_result": mock_diagnostic,
         }
 
         try:

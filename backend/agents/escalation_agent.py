@@ -354,10 +354,6 @@ def run_escalation(state: dict) -> dict:
         "ESCALATION TRIGGERED | teacher_summary=%r",
         result.teacher_summary,
     )
-    print(
-        "\n🚨 [ESCALATION ALERT] "
-        f"{result.teacher_summary}\n"
-    )
 
     state["escalation_result"] = result.model_dump()
     state["teacher_summary"] = result.teacher_summary

@@ -1,7 +1,8 @@
 """
 orchestrator.py
 ----------------
-Tutor Orchestrator — wires all 4 agents into a single LangGraph StateGraph.
+Tutor Orchestrator — wires the 4 agents + memory update into a single
+LangGraph StateGraph, Evaluator-first.
 
 Graph topology
 ==============
@@ -9,31 +10,49 @@ Graph topology
     START
       │
       ▼
-  diagnostic_node          (classifies error type + recommends strategy)
+  evaluator_node            (scores answer_quality, confidence, distress)
       │
       ▼
-  [route_after_diagnosis]
-      ├── "escalate_to_teacher" ──► escalator_node ──► END
+  [route_after_evaluation]
+      ├── correct + confidence >= 0.6 ──────────────────► tutor_planner_node (praise mode)
       │
-      └── everything else ──► evaluator_node          (scores quality + confidence)
+      └── everything else ──► diagnostic_node             (classifies error type + prereq)
                                     │
                                     ▼
-                              tutor_planner_node       (generates hint / practice Q)
-                                    │
-                                    ▼
-                                   END
+                              [route_after_diagnosis]      (escalation gate — deterministic,
+                                                             reads consecutive_misses + distress)
+                                    ├── escalate ──► escalator_node
+                                    └── otherwise ──► tutor_planner_node (hint-ladder mode)
+
+  tutor_planner_node / escalator_node ──► memory_update_node ──► END
 
 Agent responsibilities
 ======================
+  evaluator_node      — EvaluatorAgent: scores answer_quality, confidence_score,
+                         mastery_signal, distress_detected. Runs FIRST, always.
   diagnostic_node     — DiagnosticAgent: classifies error (Careless/Conceptual/
-                         Prerequisite/None) and sets recommended_strategy.
-  evaluator_node      — EvaluatorAgent: scores answer_quality and confidence_score;
-                         sets mastery_signal for the memory-update layer.
-  tutor_planner_node  — TutorPlannerAgent: uses BOTH diagnostic + evaluator results
-                         to generate the student-facing hint and optional practice
-                         question. Replaces the old hint_generator node.
+                         Prerequisite/None) and recommended_strategy. Only runs
+                         when the evaluator didn't find a confident-correct answer.
+  tutor_planner_node  — TutorPlannerAgent: two modes —
+                           * praise mode (no diagnostic_result): reinforcement +
+                             required next practice_question.
+                           * hint-ladder mode (diagnostic_result present): uses
+                             BOTH diagnostic + evaluator results to generate the
+                             student-facing hint.
   escalator_node      — EscalationAgent: only runs on the escalation branch;
                          produces teacher_summary + student holding message.
+  memory_update_node  — folds the turn's outcome into student_memory_profile
+                         (mastery, consecutive_misses, weak_prerequisites,
+                         recent_attempts). Runs last, before END.
+
+Routing (both deterministic, no LLM call)
+==========================================
+  route_after_evaluation — correct + confidence >= CONFIDENCE_THRESHOLD skips
+                            diagnosis entirely.
+  route_after_diagnosis  — the escalation gate: consecutive_misses on the
+                            current concept >= ESCALATION_MISS_THRESHOLD, OR
+                            the evaluator's distress_detected flag, sends the
+                            turn to the escalator instead of the tutor planner.
 
 Tech stack: Python 3.10+, LangGraph.
 """
@@ -46,10 +65,11 @@ from typing import Any, Optional, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from backend.agents.diagnostic_agent import InstructionalStrategy, run_diagnostic
+from backend.agents.diagnostic_agent import run_diagnostic
 from backend.agents.evaluator_agent import run_evaluator
 from backend.agents.tutor_planner import run_tutor_planner
 from backend.agents.escalation_agent import run_escalation
+from backend.memory.student_profile import run_memory_update
 
 # --------------------------------------------------------------------------- #
 # Logging
@@ -57,6 +77,13 @@ from backend.agents.escalation_agent import run_escalation
 
 logger = logging.getLogger("orchestrator")
 logging.basicConfig(level=logging.INFO)
+
+# --------------------------------------------------------------------------- #
+# Routing thresholds
+# --------------------------------------------------------------------------- #
+
+CONFIDENCE_THRESHOLD = 0.6      # correct + confidence >= this -> skip diagnosis
+ESCALATION_MISS_THRESHOLD = 4   # consecutive_misses >= this -> escalate
 
 
 # --------------------------------------------------------------------------- #
@@ -76,46 +103,47 @@ class TutorState(TypedDict, total=False):
     student_response: str           # Student's latest answer text
     student_memory_profile: dict    # Mastery levels, weak prerequisites, history
 
-    # --- Written by diagnostic_node ---
-    diagnostic_result: dict         # Full DiagnosticResult as dict
-    error_type: str                 # "None" | "Careless" | "Conceptual" | "Prerequisite"
-    recommended_strategy: str       # Drives routing + hint ladder
-
-    # --- Written by evaluator_node ---
+    # --- Written by evaluator_node (runs first) ---
     evaluator_result: dict          # Full EvaluatorResult as dict
-    answer_quality: str             # "correct" | "partially_correct" | "incorrect"
-    confidence_score: float         # 0.0–1.0
-    mastery_signal: bool            # True if positive mastery evidence
+    answer_quality: str              # "correct" | "partially_correct" | "incorrect"
+    confidence_score: float          # 0.0-1.0
+    mastery_signal: bool             # True if positive mastery evidence
+    distress_detected: bool          # True if frustration/disengagement language
+
+    # --- Written by diagnostic_node (conditional) ---
+    diagnostic_result: dict         # Full DiagnosticResult as dict
+    error_type: str                  # "None" | "Careless" | "Conceptual" | "Prerequisite"
+    recommended_strategy: str        # Drives the hint ladder
 
     # --- Written by tutor_planner_node ---
     tutor_plan_result: dict         # Full TutorPlanResult as dict
-    hint_text: str                  # Student-facing tutoring response (markdown)
+    hint_text: str                   # Student-facing tutoring response (markdown)
     practice_question: Optional[str]  # Follow-up practice Q, or None
-    escalation_flag: bool           # True if this turn needs a human teacher
+    escalation_flag: bool            # True if this turn needed a human teacher
 
-    # --- Written by escalator_node ---
+    # --- Written by escalator_node (conditional) ---
     escalation_result: dict         # Full EscalationResult as dict
-    teacher_summary: str            # Alert text for teacher_dashboard.py
+    teacher_summary: str              # Alert text for teacher_dashboard.py
 
 
 # --------------------------------------------------------------------------- #
 # Node wrappers
 # --------------------------------------------------------------------------- #
 
-def diagnostic_node(state: TutorState) -> TutorState:
-    """Classifies the student's response and sets recommended_strategy."""
-    logger.info(">diagnostic_node")
-    return run_diagnostic(dict(state))  # type: ignore[return-value]
-
-
 def evaluator_node(state: TutorState) -> TutorState:
-    """Scores answer quality and student confidence."""
+    """Scores answer quality, confidence, and distress. Always runs first."""
     logger.info(">evaluator_node")
     return run_evaluator(dict(state))  # type: ignore[return-value]
 
 
+def diagnostic_node(state: TutorState) -> TutorState:
+    """Classifies the student's error (only reached when not confident-correct)."""
+    logger.info(">diagnostic_node")
+    return run_diagnostic(dict(state))  # type: ignore[return-value]
+
+
 def tutor_planner_node(state: TutorState) -> TutorState:
-    """Generates the student-facing hint / practice question."""
+    """Generates the student-facing hint / praise + next question."""
     logger.info(">tutor_planner_node")
     return run_tutor_planner(dict(state))  # type: ignore[return-value]
 
@@ -126,21 +154,70 @@ def escalator_node(state: TutorState) -> TutorState:
     return run_escalation(dict(state))  # type: ignore[return-value]
 
 
+def memory_update_node(state: TutorState) -> TutorState:
+    """Folds this turn's outcome into student_memory_profile. Runs last."""
+    logger.info(">memory_update_node")
+    return run_memory_update(dict(state))  # type: ignore[return-value]
+
+
 # --------------------------------------------------------------------------- #
 # Conditional routing
 # --------------------------------------------------------------------------- #
 
+def route_after_evaluation(state: TutorState) -> str:
+    """
+    After evaluator_node: skip diagnosis entirely if the answer was correct
+    and the student was confident about it. Otherwise, find out why.
+    """
+    answer_quality = state.get("answer_quality")
+    confidence = state.get("confidence_score") or 0.0
+
+    if answer_quality == "correct" and confidence >= CONFIDENCE_THRESHOLD:
+        logger.info(
+            "route -> tutor_planner (praise) [quality=%s, confidence=%.2f]",
+            answer_quality,
+            confidence,
+        )
+        return "tutor_planner"
+
+    logger.info(
+        "route -> diagnostic_node [quality=%s, confidence=%.2f]",
+        answer_quality,
+        confidence,
+    )
+    return "diagnostic_node"
+
+
+def _consecutive_misses(state: TutorState) -> int:
+    """Reads the current concept's consecutive_misses from the (pre-turn) memory profile."""
+    profile = state.get("student_memory_profile") or {}
+    concept = state.get("current_concept")
+    concept_mastery = profile.get("concept_mastery", {}) or {}
+    entry = concept_mastery.get(concept, {}) or {}
+    return entry.get("consecutive_misses", 0)
+
+
 def route_after_diagnosis(state: TutorState) -> str:
     """
-    After diagnostic_node: escalate immediately if the diagnostic says so,
-    otherwise continue to evaluator -> tutor_planner.
+    The escalation gate: deterministic, no LLM call. Reads the student's
+    consecutive-miss streak on this concept (from the memory profile, before
+    this turn's update) and the evaluator's distress_detected flag.
     """
-    strategy = state.get("recommended_strategy")
-    if strategy == InstructionalStrategy.ESCALATE_TO_TEACHER.value:
-        logger.info("route -> escalator (strategy=escalate_to_teacher)")
+    misses = _consecutive_misses(state)
+    distress = bool(state.get("distress_detected"))
+
+    if misses >= ESCALATION_MISS_THRESHOLD or distress:
+        logger.info(
+            "route -> escalator [consecutive_misses=%d, distress=%s]", misses, distress
+        )
         return "escalator"
-    logger.info("route -> evaluator (strategy=%s)", strategy)
-    return "evaluator"
+
+    logger.info(
+        "route -> tutor_planner (hint) [consecutive_misses=%d, distress=%s]",
+        misses,
+        distress,
+    )
+    return "tutor_planner"
 
 
 # --------------------------------------------------------------------------- #
@@ -149,36 +226,45 @@ def route_after_diagnosis(state: TutorState) -> str:
 
 def build_tutor_graph() -> StateGraph:
     """
-    Builds (but does not compile) the 4-agent tutoring StateGraph.
+    Builds (but does not compile) the tutoring StateGraph.
     Exposed separately so tests/evals can inspect the graph before compilation.
     """
     graph = StateGraph(TutorState)
 
     # Register all nodes
-    graph.add_node("diagnostic_node", diagnostic_node)
     graph.add_node("evaluator", evaluator_node)
+    graph.add_node("diagnostic_node", diagnostic_node)
     graph.add_node("tutor_planner", tutor_planner_node)
     graph.add_node("escalator", escalator_node)
+    graph.add_node("memory_update", memory_update_node)
 
-    # Entry point
-    graph.add_edge(START, "diagnostic_node")
+    # Entry point: evaluator always runs first
+    graph.add_edge(START, "evaluator")
 
-    # Branch after diagnosis
+    # Router #1: correct + confident skips diagnosis
+    graph.add_conditional_edges(
+        "evaluator",
+        route_after_evaluation,
+        {
+            "tutor_planner": "tutor_planner",
+            "diagnostic_node": "diagnostic_node",
+        },
+    )
+
+    # Router #2: escalation gate
     graph.add_conditional_edges(
         "diagnostic_node",
         route_after_diagnosis,
         {
             "escalator": "escalator",
-            "evaluator": "evaluator",
+            "tutor_planner": "tutor_planner",
         },
     )
 
-    # Normal path: evaluator -> tutor_planner -> end
-    graph.add_edge("evaluator", "tutor_planner")
-    graph.add_edge("tutor_planner", END)
-
-    # Escalation path ends immediately after alert
-    graph.add_edge("escalator", END)
+    # Both terminal branches converge on the memory update, then end
+    graph.add_edge("tutor_planner", "memory_update")
+    graph.add_edge("escalator", "memory_update")
+    graph.add_edge("memory_update", END)
 
     return graph
 
@@ -200,13 +286,13 @@ tutor_app = compile_tutor_app()
 
 if __name__ == "__main__":
     """
-    Run all four scenarios end-to-end:
+    Run all scenarios end-to-end:
 
         $ ollama serve                        # Ollama must be running
         $ python backend/agents/orchestrator.py
 
-    Requires gemma4:12b (or whatever DIAGNOSTIC_AGENT_MODEL etc. are set to)
-    to be pulled in Ollama.
+    Requires the models set in .env (e.g. qwen2.5:7b-instruct) to be pulled
+    in Ollama.
     """
 
     base_memory = {
@@ -235,7 +321,16 @@ if __name__ == "__main__":
 
     scenarios = [
         {
-            "label": "Scenario 1 — Conceptual error, normal path (diagnostic -> evaluator -> tutor_planner)",
+            "label": "Scenario 1 — Correct + confident (praise mode, no diagnostic)",
+            "state": {
+                "current_question": "What is 1/2 + 1/3?",
+                "current_concept": "Fraction Addition",
+                "student_response": "1/2 + 1/3 = 3/6 + 2/6 = 5/6.",
+                "student_memory_profile": base_memory,
+            },
+        },
+        {
+            "label": "Scenario 2 — Conceptual error (evaluator -> diagnostic -> tutor_planner hint)",
             "state": {
                 "current_question": "What is 1/2 + 1/3?",
                 "current_concept": "Fraction Addition",
@@ -244,7 +339,7 @@ if __name__ == "__main__":
             },
         },
         {
-            "label": "Scenario 2 — Correct but low confidence (evaluator should flag; planner should strengthen)",
+            "label": "Scenario 3 — Correct but low confidence (evaluator sends to diagnostic; planner should strengthen)",
             "state": {
                 "current_question": "What is 1/2 + 1/3?",
                 "current_concept": "Fraction Addition",
@@ -253,7 +348,7 @@ if __name__ == "__main__":
             },
         },
         {
-            "label": "Scenario 3 — Careless slip",
+            "label": "Scenario 4 — Careless slip",
             "state": {
                 "current_question": "What is 1/4 + 1/4?",
                 "current_concept": "Fraction Addition",
@@ -262,7 +357,7 @@ if __name__ == "__main__":
             },
         },
         {
-            "label": "Scenario 4 — Persistent failure + distress -> escalation path",
+            "label": "Scenario 5 — Persistent failure + distress -> escalation gate fires",
             "state": {
                 "current_question": "What is 1/2 + 1/3?",
                 "current_concept": "Fraction Addition",
@@ -280,14 +375,22 @@ if __name__ == "__main__":
 
         final = tutor_app.invoke(initial_state)
 
-        print(f"\n[diagnostic]  error_type={final.get('error_type')}  "
-              f"strategy={final.get('recommended_strategy')}")
+        ev = final.get("evaluator_result")
+        if ev:
+            print(
+                f"\n[evaluator]   quality={ev.get('answer_quality')}  "
+                f"confidence={ev.get('confidence_score'):.2f}  "
+                f"mastery_signal={ev.get('mastery_signal')}  "
+                f"distress={ev.get('distress_detected')}"
+            )
 
-        if "evaluator_result" in final:
-            ev = final["evaluator_result"]
-            print(f"[evaluator]   quality={ev.get('answer_quality')}  "
-                  f"confidence={ev.get('confidence_score'):.2f}  "
-                  f"mastery_signal={ev.get('mastery_signal')}")
+        if "diagnostic_result" in final:
+            print(
+                f"[diagnostic]  error_type={final.get('error_type')}  "
+                f"strategy={final.get('recommended_strategy')}"
+            )
+        else:
+            print("[diagnostic]  skipped (evaluator: correct + confident)")
 
         if "escalation_result" in final:
             print("\n[ESCALATION]")
@@ -298,6 +401,9 @@ if __name__ == "__main__":
                 print(f"  practice_question: {final['practice_question']}")
 
         print(f"\n[hint_text shown to student]\n{final.get('hint_text', '<none>')}")
+
+        print("\n[student_memory_profile after memory_update]")
+        print(json.dumps(final.get("student_memory_profile", {}), indent=2))
 
     for scenario in scenarios:
         try:

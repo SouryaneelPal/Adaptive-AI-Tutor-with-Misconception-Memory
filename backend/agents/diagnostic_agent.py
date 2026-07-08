@@ -5,19 +5,27 @@ Diagnostic Agent for the Adaptive AI Tutor with Misconception Memory.
 
 Role
 ====
-This agent is the first "thinking" step in the tutoring loop. Given a
-student's most recent response, the concept currently being taught, and
-the student's long-term memory profile, it must:
+This agent runs ONLY when the Evaluator Agent has already determined the
+student's response is not a confident-correct answer (route_after_evaluation
+in orchestrator.py sends anything that isn't "correct + confidence >= 0.6"
+here). Given the student's response, the concept currently being taught, the
+Evaluator's quality/confidence verdict, and the student's long-term memory
+profile, it must:
 
-    1. Decide whether the answer is CORRECT or an ERROR.
+    1. Decide whether the answer is CORRECT (but shaky) or an ERROR.
     2. If it's an error, classify it as one of:
          - CARELESS      (slip / typo / arithmetic mistake, concept is fine)
          - CONCEPTUAL     (student misunderstands the current concept itself)
          - PREREQUISITE   (the gap traces back to an earlier, foundational skill)
     3. Name the specific misconception (if any), in student-facing language.
-    4. Recommend an instructional strategy for the downstream Hint Generator
+    4. Recommend an instructional strategy for the downstream Tutor Planner
        agent to execute (e.g., "small_clue", "worked_example",
        "prerequisite_review").
+
+Note: this agent does NOT decide teacher escalation. That decision is made
+deterministically by the orchestrator's escalation gate (route_after_diagnosis),
+which reads student_memory_profile's consecutive_misses and the Evaluator's
+distress_detected flag — no LLM call needed for that routing step.
 
 This module is designed to be used as a single node inside a LangGraph
 `StateGraph`. It reads from and writes to a shared `state: dict`, so it can
@@ -51,6 +59,7 @@ logger = logging.getLogger("diagnostic_agent")
 logging.basicConfig(level=logging.INFO)
 
 DEFAULT_MODEL = os.getenv("DIAGNOSTIC_AGENT_MODEL", "gemma4:e4b")
+DEFAULT_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 DEFAULT_TEMPERATURE = 0.0  # Diagnosis should be deterministic, not creative
 
 
@@ -80,7 +89,10 @@ class InstructionalStrategy(str, Enum):
     STRONGER_HINT = "stronger_hint"              # Level 2 of hint ladder
     WORKED_EXAMPLE = "worked_example"            # Level 3 of hint ladder
     PREREQUISITE_REVIEW = "prerequisite_review"  # Detour to reteach a foundational skill
-    ESCALATE_TO_TEACHER = "escalate_to_teacher"  # Repeated/severe gap -> human handoff
+    ESCALATE_TO_TEACHER = "escalate_to_teacher"  # Repeated/severe gap -> human handoff.
+                                                  # Never set by the Diagnostic Agent's LLM call —
+                                                  # only ever assigned by orchestrator.py's
+                                                  # deterministic escalation gate.
 
 
 class DiagnosticResult(BaseModel):
@@ -137,16 +149,23 @@ class DiagnosticResult(BaseModel):
 # --------------------------------------------------------------------------- #
 
 _SYSTEM_PROMPT = """\
-You are the Diagnostic Agent inside an Adaptive AI Tutor. Your ONLY job is to \
-analyze a student's response and produce a precise diagnostic classification. \
-You do NOT teach, hint, or explain the answer to the student — a separate \
-Hint Generator agent handles that using your output.
+You are the Diagnostic Agent inside an Adaptive AI Tutor. You run AFTER the \
+Evaluator Agent, which has already scored the response's quality and \
+confidence — you only run at all because the Evaluator found the response was \
+NOT a confident-correct answer. Your job is to analyze WHY, and produce a \
+precise diagnostic classification. You do NOT teach, hint, or explain the \
+answer to the student — a separate Tutor Planner agent handles that using \
+your output. You also do NOT decide whether to escalate to a teacher — that \
+is a separate, deterministic decision made outside your scope; never pick \
+"escalate_to_teacher" as recommended_strategy.
 
 Classification rules (apply in this order):
 
-1. CORRECT — The student's response is mathematically/conceptually correct \
-   (minor phrasing differences are fine). Set is_correct=true, \
-   error_type="None", recommended_strategy="none".
+1. CORRECT (but shaky) — The Evaluator already flagged this response as \
+   correct with low confidence, or as ambiguous. If the response is genuinely \
+   mathematically/conceptually correct, set is_correct=true, error_type="None", \
+   recommended_strategy="none" — the Tutor Planner will calibrate tone/strength \
+   using the Evaluator's confidence_score.
 
 2. CARELESS — The student clearly knows the underlying concept (their \
    reasoning, setup, or method is sound) but made a slip: a typo, an \
@@ -170,12 +189,6 @@ Classification rules (apply in this order):
    Set missing_prerequisite to the name of that foundational skill. \
    recommended_strategy="prerequisite_review".
 
-Escalation override: regardless of the above, if student_memory_profile shows \
-a long streak of repeated failures on this exact concept (e.g., \
-consecutive_misses >= 4) or explicit signals of distress/frustration in the \
-response, set recommended_strategy="escalate_to_teacher" instead, while still \
-reporting the correct error_type and misconception.
-
 Be conservative: only claim CONCEPTUAL or PREREQUISITE if the response gives \
 clear evidence. If you are unsure between Careless and Conceptual, prefer \
 Careless and lower your confidence score.
@@ -192,6 +205,10 @@ Current concept being taught: {current_concept}
 Student's memory profile (mastery levels, known weak prerequisites, and \
 recent history for this concept):
 {student_memory_profile}
+
+Evaluator Agent result (already scored this response's quality/confidence — \
+use as context, but form your own error classification):
+{evaluator_result}
 
 Student's most recent response:
 \"\"\"{student_response}\"\"\"
@@ -224,6 +241,7 @@ class DiagnosticAgent:
     def __init__(
         self,
         model: str = DEFAULT_MODEL,
+        base_url: str = DEFAULT_BASE_URL,
         temperature: float = DEFAULT_TEMPERATURE,
     ) -> None:
         self.parser = PydanticOutputParser(pydantic_object=DiagnosticResult)
@@ -235,7 +253,8 @@ class DiagnosticAgent:
         # human-readable format instructions inside the prompt as a
         # belt-and-suspenders fallback.
         llm = ChatOllama(
-            model=model, 
+            model=model,
+            base_url=base_url,
             temperature=temperature,
             format="json"  # Forces the local model to output valid JSON
         )
@@ -248,6 +267,7 @@ class DiagnosticAgent:
         student_response: str,
         current_concept: str,
         student_memory_profile: dict[str, Any],
+        evaluator_result: dict[str, Any],
     ) -> DiagnosticResult:
         """
         Run the diagnostic classification for a single student turn.
@@ -257,6 +277,8 @@ class DiagnosticAgent:
             current_concept: The topic currently being taught, e.g. "Fraction Addition".
             student_memory_profile: Dict describing concept mastery / known
                 weak prerequisites / recent attempt history for this student.
+            evaluator_result: The Evaluator Agent's quality/confidence verdict
+                for this same response (already computed upstream).
 
         Returns:
             A validated DiagnosticResult.
@@ -269,6 +291,7 @@ class DiagnosticAgent:
                     "student_memory_profile": json.dumps(
                         student_memory_profile, indent=2
                     ),
+                    "evaluator_result": json.dumps(evaluator_result, indent=2),
                 }
             )
             return result
@@ -310,21 +333,21 @@ def _get_default_agent() -> DiagnosticAgent:
 
 def run_diagnostic(state: dict) -> dict:
     """
-    LangGraph node function.
+    LangGraph node function. Runs after evaluator_node, only on the branch
+    where route_after_evaluation decided the response wasn't confident-correct.
 
     Expected keys read from `state`:
         - "student_response" (str): required
         - "current_concept" (str): required
         - "student_memory_profile" (dict): optional, defaults to {}
+        - "evaluator_result" (dict): required, produced by run_evaluator
 
     Keys written back into `state`:
         - "diagnostic_result" (dict): the DiagnosticResult, JSON-serializable,
           for easy consumption by downstream nodes / the Streamlit frontend.
-        - "error_type" (str): convenience top-level copy, used by the
-          orchestrator's conditional routing edges (e.g.,
-          `graph.add_conditional_edges("diagnostic", route_on_error_type, ...)`)
+        - "error_type" (str): convenience top-level copy.
         - "recommended_strategy" (str): convenience top-level copy, consumed
-          directly by hint_generator.py.
+          directly by tutor_planner.py.
 
     Returns:
         The updated state dict (LangGraph merges this back into the graph's
@@ -333,6 +356,7 @@ def run_diagnostic(state: dict) -> dict:
     student_response = state.get("student_response")
     current_concept = state.get("current_concept")
     student_memory_profile = state.get("student_memory_profile", {}) or {}
+    evaluator_result = state.get("evaluator_result", {}) or {}
 
     if not student_response or not current_concept:
         raise ValueError(
@@ -345,6 +369,7 @@ def run_diagnostic(state: dict) -> dict:
         student_response=student_response,
         current_concept=current_concept,
         student_memory_profile=student_memory_profile,
+        evaluator_result=evaluator_result,
     )
 
     logger.info(
@@ -392,6 +417,15 @@ if __name__ == "__main__":
             "label": "Prerequisite gap example",
             "student_response": "1/2 + 1/3 = 2/5 because you just add the tops and add the bottoms.",
             "current_concept": "Fraction Addition",
+            "evaluator_result": {
+                "answer_quality": "incorrect",
+                "quality_reasoning": "Added numerators and denominators separately.",
+                "confidence_score": 0.8,
+                "confidence_reasoning": "Stated the answer directly with no hedging.",
+                "mastery_signal": False,
+                "distress_detected": False,
+                "distress_reasoning": "Neutral tone, no frustration language.",
+            },
         },
         {
             "label": "Careless slip example",
@@ -400,11 +434,29 @@ if __name__ == "__main__":
                 "So it's 1/4 + 1/4 = 2/8."
             ),
             "current_concept": "Fraction Addition",
+            "evaluator_result": {
+                "answer_quality": "incorrect",
+                "quality_reasoning": "Correct method, arithmetic slip on the final step.",
+                "confidence_score": 0.7,
+                "confidence_reasoning": "Direct, confident phrasing.",
+                "mastery_signal": False,
+                "distress_detected": False,
+                "distress_reasoning": "No frustration language.",
+            },
         },
         {
-            "label": "Correct answer example",
-            "student_response": "1/2 + 1/4 = 2/4 + 1/4 = 3/4.",
+            "label": "Correct but shaky confidence example",
+            "student_response": "Maybe 1/2 + 1/4 = 2/4 + 1/4 = 3/4? I think that's right.",
             "current_concept": "Fraction Addition",
+            "evaluator_result": {
+                "answer_quality": "correct",
+                "quality_reasoning": "Correctly converted to a common denominator and added.",
+                "confidence_score": 0.3,
+                "confidence_reasoning": "Hedged with 'maybe' and 'I think'.",
+                "mastery_signal": False,
+                "distress_detected": False,
+                "distress_reasoning": "No frustration language.",
+            },
         },
     ]
 
@@ -419,6 +471,7 @@ if __name__ == "__main__":
             "student_response": case["student_response"],
             "current_concept": case["current_concept"],
             "student_memory_profile": mock_memory_profile,
+            "evaluator_result": case["evaluator_result"],
         }
 
         try:

@@ -1,70 +1,191 @@
 import streamlit as st
-import pandas as st_pandas
 import datetime
 
 from backend.agents.orchestrator import tutor_app
 
 # --- Page Configuration ---
-st.set_page_config(page_title="Adaptive AI Tutor", layout="wide")
+st.set_page_config(
+    page_title="Adaptive AI Tutor",
+    page_icon="🧠",
+    layout="wide",
+)
+
+# --- Lightweight styling ---
+st.markdown(
+    """
+    <style>
+        .block-container { padding-top: 2rem; }
+        .stChatMessage { border-radius: 12px; }
+        div[data-testid="stMetric"] {
+            background: #f7f9fc;
+            border: 1px solid #e6eaf0;
+            padding: 14px 16px;
+            border-radius: 12px;
+        }
+        .pill {
+            display: inline-block; padding: 2px 10px; border-radius: 999px;
+            font-size: 0.75rem; font-weight: 600; margin-left: 6px;
+        }
+        .pill-ok   { background:#e5f6ea; color:#1a7f37; }
+        .pill-warn { background:#fdecea; color:#b42318; }
+        .pill-info { background:#e8f0fe; color:#1a56db; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("🧠 Adaptive AI Tutor with Misconception Memory")
 
-# --- Initialize Session State for Chat ---
+# --- Session State: chat ---
 if "messages" not in st.session_state:
     st.session_state.messages = [
         {"role": "assistant", "content": "Hi! What would you like to learn today?"}
     ]
 
-# --- UI Layout: Tabs mapping to the Flowchart ---
+# --- Session State: student memory profile ---
+if "memory_profile" not in st.session_state:
+    st.session_state.memory_profile = {
+        "student_id": "demo_student",
+        "concept_mastery": {},
+        "weak_prerequisites": [],
+        "recent_attempts": [],
+    }
+
+# --- Session State: last turn's raw result (for internals + teacher view) ---
+if "last_final_state" not in st.session_state:
+    st.session_state.last_final_state = {}
+
+# --- Session State: running log of escalations this session ---
+if "escalation_log" not in st.session_state:
+    st.session_state.escalation_log = []
+
+
+# =====================================================================
+# SIDEBAR — session controls + internals toggle
+# =====================================================================
+with st.sidebar:
+    st.subheader("⚙️ Session")
+    current_concept = st.text_input(
+        "Current Topic",
+        value="Fractions",
+        placeholder="e.g. Probability, Fractions, Algebra...",
+        help="Set the concept the student is currently studying.",
+    )
+
+    show_internals = st.toggle(
+        "🔬 Show tutor internals",
+        value=False,
+        help="Reveal memory profile, diagnostics, and which agent handled the last turn.",
+    )
+
+    if st.button("🔄 Reset session"):
+        st.session_state.messages = [
+            {"role": "assistant", "content": "Hi! What would you like to learn today?"}
+        ]
+        st.session_state.memory_profile = {
+            "student_id": "demo_student",
+            "concept_mastery": {},
+            "weak_prerequisites": [],
+            "recent_attempts": [],
+        }
+        st.session_state.last_final_state = {}
+        st.session_state.escalation_log = []
+        st.rerun()
+
+    if show_internals:
+        st.divider()
+        st.caption("🧠 Live memory profile")
+        st.json(st.session_state.memory_profile)
+
+        last = st.session_state.last_final_state
+        if last:
+            st.caption("🩺 Last evaluation")
+            st.json(last.get("evaluator_result", {}))
+            if "diagnostic_result" in last:
+                st.caption("🔍 Last diagnostic")
+                st.json(last.get("diagnostic_result", {}))
+
+            # Which path ran last turn?
+            if "escalation_result" in last:
+                path = "evaluator → diagnostic → escalator"
+            elif "diagnostic_result" in last:
+                path = "evaluator → diagnostic → tutor_planner (hint)"
+            else:
+                path = "evaluator → tutor_planner (praise)"
+            st.caption("🧭 Agent path (last turn)")
+            st.code(path, language=None)
+
+
+# =====================================================================
+# TABS
+# =====================================================================
 tab_student, tab_teacher = st.tabs(["🎓 Student Workspace", "📊 Teacher Dashboard"])
 
-# ==========================================
-# TAB 1: STUDENT WORKSPACE (Flowchart Steps 1-7)
-# ==========================================
+
+# ---------------------------------------------------------------------
+# Helper: pull the graph's memory-update result into session state
+# ---------------------------------------------------------------------
+def update_memory_from_turn(final_state: dict, concept: str, student_msg: str) -> None:
+    # The graph's memory_update node (backend/memory/student_profile.py) has
+    # already folded this turn's outcome into student_memory_profile — just
+    # adopt it. Profile mutation itself lives in the graph now, not here.
+    updated_profile = final_state.get("student_memory_profile")
+    if updated_profile:
+        st.session_state.memory_profile = updated_profile
+
+    # Escalation-log table is a session-scoped UI concern, not part of the
+    # durable profile, so it's still built here.
+    if "escalation_result" in final_state:
+        concept_entry = st.session_state.memory_profile.get("concept_mastery", {}).get(
+            concept, {}
+        )
+        st.session_state.escalation_log.append(
+            {
+                "Time": datetime.datetime.now().strftime("%H:%M:%S"),
+                "Topic": concept,
+                "Trigger": final_state.get("teacher_summary", "Escalation triggered")[:80],
+                "Misses": concept_entry.get("consecutive_misses", 0),
+            }
+        )
+
+
+# =====================================================================
+# TAB 1 — STUDENT WORKSPACE
+# =====================================================================
 with tab_student:
     st.header("Active Learning Session")
-    
-    # Simulating Flowchart Step 3 & 4: Profile Check & Misconception
-    with st.sidebar:
-        st.subheader("Student Profile (Hidden from student in prod)")
-        current_concept = st.text_input(
-            "Current Topic",
-            value="Fractions",
-            placeholder="e.g. Probability, Fractions, Algebra...",
-            help="Set the concept the student is currently studying.",
-        )
-        st.info(f"**Current Topic:** {current_concept}\n\n**Known Weakness:** Division logic")
-        st.success("**Confidence Score:** Moderate")
 
-    # Chat Interface
-    chat_container = st.container(height=400)
+    chat_container = st.container(height=440)
     with chat_container:
         for message in st.session_state.messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
-    # Flowchart Step 1: Student Ask
     if prompt := st.chat_input("Ask a question (e.g., Why is 1/2 bigger than 1/3?)"):
-        # Display user message
         st.session_state.messages.append({"role": "user", "content": prompt})
         with chat_container:
             with st.chat_message("user"):
                 st.markdown(prompt)
 
-        # Flowchart Step 2 & 5: Diagnostic & Tutor Plan — call the real orchestrator
         with st.spinner("Thinking..."):
             try:
                 initial_state = {
                     "current_question": prompt,
                     "current_concept": current_concept,
                     "student_response": prompt,
-                    "student_memory_profile": {},
+                    "student_memory_profile": st.session_state.memory_profile,
                 }
                 final_state = tutor_app.invoke(initial_state)
+                st.session_state.last_final_state = final_state
+
                 tutor_response = (
                     final_state.get("hint_text")
                     or final_state.get("teacher_summary")
                     or "I'm not sure how to respond to that — could you rephrase?"
                 )
+
+                update_memory_from_turn(final_state, current_concept, prompt)
+
             except Exception as exc:
                 tutor_response = f"⚠️ Tutor error: {exc}"
 
@@ -73,47 +194,73 @@ with tab_student:
             with st.chat_message("assistant"):
                 st.markdown(tutor_response)
 
+        # If internals are on, surface the agent path inline too
+        if show_internals and st.session_state.last_final_state:
+            last = st.session_state.last_final_state
+            if "escalation_result" in last:
+                st.markdown('<span class="pill pill-warn">Escalated to teacher</span>', unsafe_allow_html=True)
+            elif "diagnostic_result" in last:
+                q = last.get("evaluator_result", {}).get("answer_quality", "?")
+                st.markdown(f'<span class="pill pill-info">Tutored · answer: {q}</span>', unsafe_allow_html=True)
+            else:
+                st.markdown('<span class="pill pill-ok">Correct · praised + next question</span>', unsafe_allow_html=True)
 
-# ==========================================
-# TAB 2: TEACHER DASHBOARD (Flowchart Steps 8-11)
-# ==========================================
+
+# =====================================================================
+# TAB 2 — TEACHER DASHBOARD (live session data)
+# =====================================================================
 with tab_teacher:
     st.header("Classroom Monitoring & Escalations")
-    
-    # Flowchart Step 11: Teacher View (Progress & Risks)
+
+    profile = st.session_state.memory_profile
+    concept_mastery = profile.get("concept_mastery", {})
+    attempts = profile.get("recent_attempts", [])
+
+    # --- Top metrics, derived from the live session ---
+    total_attempts = len(attempts)
+    correct_attempts = sum(1 for a in attempts if a.get("correct"))
+    accuracy = f"{(correct_attempts / total_attempts * 100):.0f}%" if total_attempts else "—"
+    num_escalations = len(st.session_state.escalation_log)
+
     col1, col2, col3 = st.columns(3)
-    col1.metric("Active Sessions", "24", "3")
-    col2.metric("Average Learning Gain", "+18%", "Pre to Post Test")
-    col3.metric("Escalations", "2", "-1", delta_color="inverse")
+    col1.metric("Attempts this session", total_attempts)
+    col2.metric("Answer accuracy", accuracy)
+    col3.metric("Escalations", num_escalations)
 
     st.divider()
 
-    # Flowchart Step 8: Escalation (Teacher Handoff)
+    # --- Active escalations from THIS session ---
     st.subheader("🚨 Active Escalations (Requires Intervention)")
-    escalation_data = [
-        {"Student": "Alex M.", "Topic": "Fractions", "Trigger": "Repeated confusion (Failed 3 hints)", "Confidence": "Low", "Action": "Intervene"},
-        {"Student": "Jamie T.", "Topic": "Calculus", "Trigger": "Frustration detected in text", "Confidence": "Low", "Action": "Intervene"}
-    ]
-    st.table(escalation_data)
+    if st.session_state.escalation_log:
+        st.table(st.session_state.escalation_log)
+    else:
+        st.success("No escalations yet this session. ✅")
 
     colA, colB = st.columns(2)
-    
+
     with colA:
-        # Flowchart Step 4 & 9: Misconception Graph & Memory Update
         st.subheader("🧠 Concept Mastery & Misconceptions")
-        st.write("Current mapping of class weaknesses:")
-        misconception_data = {
-            "Concept": ["Fraction Addition", "Matrix Traces", "Probability Rules"],
-            "Mastery Level": ["45%", "82%", "60%"],
-            "Missing Prerequisite": ["Common Denominators", "None", "Combinatorics"]
-        }
-        st.dataframe(misconception_data, use_container_width=True)
+        if concept_mastery:
+            rows = []
+            for concept, data in concept_mastery.items():
+                rows.append({
+                    "Concept": concept,
+                    "Mastery": f"{data.get('mastery', 0) * 100:.0f}%",
+                    "Consecutive Misses": data.get("consecutive_misses", 0),
+                })
+            st.dataframe(rows, use_container_width=True)
+        else:
+            st.info("No concepts tracked yet — start a session in the Student tab.")
 
     with colB:
-        # Flowchart Step 10: Revision Plan
-        st.subheader("📅 Recommended Revision Plans")
-        st.info(
-            "**Group A (Alex, Sam, Taylor):** \n"
-            "Schedule adaptive practice on *Common Denominators* before proceeding to *Fraction Addition*."
-        )
-        st.button("Deploy Revision Quiz to Group A")
+        st.subheader("📅 Weak Prerequisites Detected")
+        weak = profile.get("weak_prerequisites", [])
+        if weak:
+            for wp in weak:
+                st.markdown(f"- {wp}")
+            st.info(
+                "Recommended: schedule targeted revision on the prerequisites above "
+                "before advancing the current topic."
+            )
+        else:
+            st.info("No missing prerequisites detected yet.")
