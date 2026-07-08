@@ -3,4 +3,5 @@ langgraph
 langchain-ollama
 python-dotenv 
 langchain-core 
-pydantic backend-ai-agent
+pydantic 
+backend-ai-agent
