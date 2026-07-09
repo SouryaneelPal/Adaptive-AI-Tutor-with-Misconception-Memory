@@ -18,8 +18,7 @@ the student's response). It does two distinct jobs in one call:
        student their teacher has been looped in, WITHOUT giving away the
        answer and without sounding clinical or alarming.
 
-Unlike hint_generator.py, this agent never needs to reason about the hint
-ladder — it always produces both outputs, and `escalation_flag` is always
+This agent always produces both outputs, and `escalation_flag` is always
 True by construction (it's only ever invoked once that decision has already
 been made upstream by the Diagnostic Agent / orchestrator routing).
 
@@ -52,8 +51,7 @@ load_dotenv()  # Pulls OLLAMA_HOST / model overrides from backend/.env if presen
 logger = logging.getLogger("escalation_agent")
 logging.basicConfig(level=logging.INFO)
 
-# Local inference via Ollama, matching hint_generator.py's setup so both
-# agents can share one running Ollama instance.
+# Local inference via Ollama.
 DEFAULT_MODEL = os.getenv("ESCALATION_AGENT_MODEL", "gemma4:e4b")
 DEFAULT_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 DEFAULT_TEMPERATURE = float(os.getenv("ESCALATION_AGENT_TEMPERATURE", "0.3"))
@@ -230,8 +228,7 @@ class EscalationAgent:
 
         # format="json" constrains local Ollama generation to valid JSON,
         # which we then validate against EscalationResult via the parser —
-        # same pattern used in hint_generator.py for consistency and to
-        # avoid relying on tool-calling support that varies across local
+        # avoids relying on tool-calling support that varies across local
         # models.
         self.llm = ChatOllama(
             model=model,

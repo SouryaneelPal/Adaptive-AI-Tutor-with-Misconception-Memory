@@ -113,3 +113,54 @@ Example: 1 1/2 + 2 1/3
 3. **Need common denominator for multiplication**: WRONG — only for addition/subtraction.
 4. **Flipping wrong fraction in division**: Always flip the second (divisor) fraction.
 5. **Cancelling when adding**: Students try to cross-cancel when adding fractions — this only works in multiplication.
+
+## Grading Rubric — Adding Same Denominator
+CORRECT: Adds numerators only, keeps denominator unchanged (2/5 + 1/5 = 3/5).
+PARTIAL: Correct method but arithmetic error in numerator.
+WRONG: Adds both numerators AND denominators (2/5 + 1/5 = 3/10); multiplies instead of adds.
+
+## Grading Rubric — Adding Different Denominators
+CORRECT: Finds LCD, converts both fractions, adds numerators only, simplifies if needed.
+PARTIAL: Found correct LCD but converted only one fraction; correct LCD but arithmetic error.
+WRONG: Adds numerators AND denominators (1/2 + 1/3 = 2/5); uses larger denominator instead of LCD; does not convert before adding.
+
+## Grading Rubric — Multiplying Fractions
+CORRECT: Multiplies numerator × numerator, denominator × denominator, simplifies.
+PARTIAL: Correct multiplication but did not simplify.
+WRONG: Finds common denominator first (only needed for add/subtract); adds instead of multiplies.
+
+## Grading Rubric — Dividing Fractions
+CORRECT: Flips second fraction, multiplies, simplifies (Keep Change Flip).
+PARTIAL: Flipped correct fraction but made multiplication error.
+WRONG: Flips first fraction instead of second; divides numerator by numerator and denominator by denominator; does not flip at all.
+
+## Grading Rubric — Comparing Fractions
+CORRECT: Converts to common denominator and compares numerators; or cross-multiplies correctly.
+WRONG: Compares only numerators ignoring denominators; says larger denominator means larger fraction.
+
+## Worked Example — Adding Different Denominators
+**Problem**: What is 1/4 + 1/6?
+Step 1: LCD of 4 and 6 → multiples of 4: 4,8,12 | multiples of 6: 6,12 → LCD = 12
+Step 2: 1/4 = 3/12 (×3); 1/6 = 2/12 (×2)
+Step 3: 3/12 + 2/12 = 5/12
+**Answer: 5/12**
+
+## Worked Example — Subtracting Fractions
+**Problem**: What is 3/4 − 1/6?
+Step 1: LCD of 4 and 6 = 12
+Step 2: 3/4 = 9/12; 1/6 = 2/12
+Step 3: 9/12 − 2/12 = 7/12
+**Answer: 7/12**
+
+## Worked Example — Multiplying Fractions
+**Problem**: What is 2/3 × 3/5?
+Step 1: Multiply numerators: 2 × 3 = 6
+Step 2: Multiply denominators: 3 × 5 = 15
+Step 3: Simplify 6/15 ÷ 3 = 2/5
+**Answer: 2/5** — No common denominator needed for multiplication.
+
+## Worked Example — Dividing Fractions
+**Problem**: What is 3/4 ÷ 1/2?
+Step 1: Keep 3/4. Change ÷ to ×. Flip 1/2 to 2/1.
+Step 2: 3/4 × 2/1 = 6/4 = 3/2
+**Answer: 3/2 = 1½** — Always flip the SECOND fraction.

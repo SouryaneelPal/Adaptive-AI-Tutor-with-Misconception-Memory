@@ -159,3 +159,44 @@ Regular polygon: all sides and angles equal. Each interior angle = [(n−2) × 1
 3. **Using diameter in the area formula**: Area = πr². Use radius, not diameter.
 4. **Confusing perimeter and area**: Perimeter = boundary length; area = space enclosed.
 5. **Complementary vs supplementary**: Complementary = 90°, supplementary = 180°.
+
+## Grading Rubric — Angles in a Triangle
+CORRECT: States angles sum to 180°; subtracts known angles to find missing angle.
+PARTIAL: Correct method but arithmetic error.
+WRONG: Uses 360° instead of 180°; says angles sum to 90°.
+
+## Grading Rubric — Area of a Triangle
+CORRECT: Area = ½ × base × perpendicular height; uses correct height; correct units².
+PARTIAL: Correct formula but forgot to halve (base × height only); correct calculation but wrong units.
+WRONG: Uses slant height instead of perpendicular height; uses perimeter formula.
+
+## Grading Rubric — Area of a Circle
+CORRECT: Area = πr²; correctly identifies radius (not diameter); correct units².
+PARTIAL: Correct formula but used diameter instead of radius.
+WRONG: Uses diameter as radius (off by factor of 4); uses circumference formula (2πr); forgets to square radius.
+
+## Grading Rubric — Perimeter
+CORRECT: Adds all side lengths; uses correct linear units (not squared).
+PARTIAL: Added correctly but missed one side.
+WRONG: Multiplies sides (area formula); uses squared units for perimeter.
+
+## Worked Example — Missing Angle in Triangle
+**Problem**: Triangle has angles 65° and 75°. Find the third.
+Step 1: Angles in a triangle sum to 180°.
+Step 2: 65 + 75 + x = 180 → 140 + x = 180 → x = 40°
+**Answer: 40°**
+
+## Worked Example — Area of a Triangle
+**Problem**: Base = 10 cm, perpendicular height = 6 cm.
+Area = ½ × 10 × 6 = ½ × 60 = **30 cm²**
+Use the perpendicular height — not the slant side.
+
+## Worked Example — Area of a Circle
+**Problem**: Circle with radius 7 cm. (π ≈ 3.14)
+Area = π × r² = 3.14 × 49 = **153.86 cm²**
+If given diameter = 14, first find radius = 14 ÷ 2 = 7.
+
+## Worked Example — Perimeter of a Rectangle
+**Problem**: Rectangle 9 m × 4 m.
+P = 2 × (9 + 4) = 2 × 13 = **26 m**
+Perimeter uses metres (not m²) — it is a length, not an area.

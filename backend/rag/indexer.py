@@ -1,22 +1,9 @@
 """
 indexer.py
 -----------
-Builds and caches a FAISS vector index from the curriculum markdown files in
-backend/curriculum/.
-
-Design decisions
-================
-- FAISS (in-memory): no database or Docker required; perfect for a single-process
-  app where the index fits easily in RAM (5 files, ~2-5 MB total).
-- nomic-embed-text via OllamaEmbeddings: stays fully local, no API key, strong
-  quality on educational/factual text.
-- MarkdownHeaderTextSplitter on "##" headers: splits at semantic section
-  boundaries (Definition, Worked Example, Common Misconceptions...) instead of
-  arbitrary token windows, so each chunk is a meaningful, self-contained unit.
-- Metadata tags (concept + section) on every chunk: lets the retriever do a
-  hard concept-filter before semantic ranking, preventing cross-topic confusion.
-- Singleton pattern: index is built once on first access and reused across all
-  agent calls in the session.
+Builds and caches a ChromaDB vector index from the curriculum markdown files in
+backend/curriculum/. Each file covers one topic and contains the lesson,
+rubrics, and worked examples in combined ## sections.
 """
 
 from __future__ import annotations
@@ -32,6 +19,7 @@ from langchain_text_splitters import MarkdownHeaderTextSplitter
 logger = logging.getLogger("rag.indexer")
 
 CURRICULUM_DIR  = Path(__file__).parent.parent / "curriculum"
+CHROMA_DIR      = Path(__file__).parent / ".chromadb"
 EMBED_MODEL     = os.getenv("EMBED_MODEL", "nomic-embed-text")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
@@ -57,8 +45,8 @@ def _load_curriculum_docs() -> list[Document]:
 
     for md_file in sorted(CURRICULUM_DIR.glob("*.md")):
         stem    = md_file.stem.lower()
-        concept = _CONCEPT_MAP.get(stem, stem.replace("_", " ").title())
         text    = md_file.read_text(encoding="utf-8")
+        concept = _CONCEPT_MAP.get(stem, stem.replace("_", " ").title())
 
         chunks = splitter.split_text(text)
         for chunk in chunks:
@@ -70,26 +58,41 @@ def _load_curriculum_docs() -> list[Document]:
     return docs
 
 
-_index = None   # FAISS singleton, built once per process
+_index = None   # ChromaDB singleton, loaded once per process
 
 
 def get_index():
     """
-    Returns the singleton FAISS index, building it on first call.
-    Raises RuntimeError with a clear message if dependencies are missing.
+    Returns the singleton ChromaDB index.
+    - First run: builds from curriculum docs and persists to CHROMA_DIR.
+    - Subsequent runs: loads from CHROMA_DIR (fast — no re-embedding needed).
     """
     global _index
     if _index is not None:
         return _index
 
     try:
-        from langchain_community.vectorstores import FAISS
+        from langchain_chroma import Chroma
     except ImportError as exc:
         raise RuntimeError(
-            "langchain-community is not installed. "
-            "Run: pip install langchain-community faiss-cpu"
+            "langchain-chroma is not installed. "
+            "Run: pip install chromadb langchain-chroma"
         ) from exc
 
+    embeddings = OllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_BASE_URL)
+
+    # Load from disk if already built — avoids re-embedding on every restart.
+    if CHROMA_DIR.exists() and any(CHROMA_DIR.iterdir()):
+        logger.info("Loading curriculum index from %s ...", CHROMA_DIR)
+        _index = Chroma(
+            persist_directory=str(CHROMA_DIR),
+            embedding_function=embeddings,
+        )
+        count = _index._collection.count()
+        logger.info("Curriculum index loaded: %d vectors.", count)
+        return _index
+
+    # First run — build and persist.
     logger.info("Building curriculum index with embed model=%r ...", EMBED_MODEL)
     docs = _load_curriculum_docs()
 
@@ -99,10 +102,27 @@ def get_index():
             "Add .md files to backend/curriculum/ and restart."
         )
 
-    embeddings = OllamaEmbeddings(model=EMBED_MODEL, base_url=OLLAMA_BASE_URL)
-    _index = FAISS.from_documents(docs, embeddings)
-    logger.info("Curriculum index ready: %d chunks.", len(docs))
+    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+    _index = Chroma.from_documents(
+        docs,
+        embeddings,
+        persist_directory=str(CHROMA_DIR),
+    )
+    logger.info("Curriculum index built and persisted: %d chunks.", len(docs))
     return _index
+
+
+def reset_index() -> None:
+    """
+    Deletes the persisted index and resets the singleton. Call this after
+    adding new curriculum files so the next get_index() rebuilds from scratch.
+    """
+    global _index
+    _index = None
+    if CHROMA_DIR.exists():
+        import shutil
+        shutil.rmtree(CHROMA_DIR)
+        logger.info("ChromaDB index deleted — will rebuild on next get_index() call.")
 
 
 def available_concepts() -> list[str]:
