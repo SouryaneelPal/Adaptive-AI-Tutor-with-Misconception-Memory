@@ -101,7 +101,7 @@ class DiagnosticResult(BaseModel):
     """
     Strict, structured output produced by the Diagnostic Agent.
     This is what gets written into the shared LangGraph state and consumed
-    by hint_generator.py / escalation_agent.py / misconception_graph.py.
+    by escalation_agent.py and tutor_planner.py.
     """
 
     is_correct: bool = Field(
