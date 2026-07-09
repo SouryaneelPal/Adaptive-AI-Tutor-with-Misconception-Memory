@@ -69,6 +69,7 @@ Thumbs.db
 
 # Streamlit (for Phase A)
 .streamlit/secrets.toml
+<<<<<<< HEAD
 
 # ChromaDB persisted index (generated, rebuild with reset_index())
 backend/rag/.chromadb/
@@ -76,3 +77,5 @@ backend/rag/chroma_store/
 
 # Docker
 docker-compose.override.yml
+=======
+>>>>>>> bdff0843625b1c23c03298d4d498d94f6e0d9397
