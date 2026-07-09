@@ -65,11 +65,11 @@ set each piece up.
 **Option A — run it locally:**
 ```bash
 ollama serve
-ollama pull llama3.2          # or any chat-capable model you prefer
+ollama pull gemma4:31b          # or any chat-capable model you prefer
 ollama pull nomic-embed-text  # required for the RAG curriculum retriever
 ```
 Leave `.env`'s `OLLAMA_BASE_URL=http://localhost:11434` as-is, and set every
-`*_MODEL` variable to whatever chat model you pulled (e.g. `llama3.2`).
+`*_MODEL` variable to whatever chat model you pulled (e.g. `gemma4:31b`).
 
 **Option B — use a shared host** (e.g. a team GPU box): the server there
 **must** be started with `OLLAMA_HOST=0.0.0.0:11434` (Ollama binds to
@@ -166,7 +166,7 @@ python -m backend.agents.orchestrator        # full multi-scenario run through t
   it up yet — every read/write degrades to a safe fallback instead of
   crashing. Follow step 4 to get real persistence.
 - **A model response takes 60+ seconds**: you're likely running a large
-  model on CPU only. Try a smaller model (e.g. `llama3.2` over `mistral`) or
+  model on CPU only. Try a smaller model (e.g. `gemma4:31b` over `mistral`) or
   point at a GPU-backed Ollama host.
 - **Windows note**: running a file directly as `python backend/agents/x.py`
   can fail with `ModuleNotFoundError: No module named 'backend'` because the

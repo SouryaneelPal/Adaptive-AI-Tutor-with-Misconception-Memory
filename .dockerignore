@@ -1,0 +1,52 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# .dockerignore — keeps the build context small and prevents secrets / local
+# artefacts from leaking into the image.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Git internals
+.git
+.gitignore
+
+# Python caches & compiled bytecode
+__pycache__
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments (the image builds its own inside the venv stage)
+.venv
+venv
+env
+ENV
+
+# Local environment file (NEVER bake secrets into the image)
+.env
+
+# IDE / editor files
+.vscode
+.idea
+*.swp
+*.swo
+*.swn
+.DS_Store
+Thumbs.db
+
+# Test artefacts
+.pytest_cache
+.coverage
+htmlcov
+*.egg-info
+dist
+build
+
+# Local data that should come from volumes at runtime
+backend/data/*.db
+backend/rag/chroma_store/
+
+# Docker files themselves (not needed inside the image)
+docker-compose*.yml
+Dockerfile*
+
+# Documentation
+*.md
