@@ -9,3 +9,6 @@ streamlit
 sqlalchemy
 pymysql
 ollama
+fastapi
+uvicorn[standard]
+aiofiles

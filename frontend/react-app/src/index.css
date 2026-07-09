@@ -36,6 +36,10 @@
   --animate-busmove:   busmove 8s linear infinite;
   --animate-startwink: startwink 1.5s ease-in-out infinite;
   --animate-hpbar:     hpbar 1.5s ease-out forwards;
+  --animate-mascot-walk: mascotWalk 1.5s ease-in-out;
+  --animate-slideup:   slideUp 0.4s ease-out forwards;
+  --animate-fadein:    fadeIn 0.3s ease-out forwards;
+  --animate-pulse-glow: pulseGlow 2s ease-in-out infinite;
 
   @keyframes float {
     0%,100% { transform: translateY(0px); }
@@ -84,6 +88,45 @@
     from { width: 0%; }
     to   { width: var(--fill, 70%); }
   }
+  @keyframes mascotWalk {
+    0%   { transform: translateX(0) scaleX(1); }
+    25%  { transform: translateX(8px) scaleX(-1); }
+    50%  { transform: translateX(4px) scaleX(-1); }
+    75%  { transform: translateX(2px) scaleX(1); }
+    100% { transform: translateX(0) scaleX(1); }
+  }
+  @keyframes slideUp {
+    0%   { transform: translateY(20px); opacity: 0; }
+    100% { transform: translateY(0);    opacity: 1; }
+  }
+  @keyframes fadeIn {
+    0%   { opacity: 0; }
+    100% { opacity: 1; }
+  }
+  @keyframes pulseGlow {
+    0%,100% { box-shadow: 0 0 8px currentColor; }
+    50%     { box-shadow: 0 0 20px currentColor, 0 0 40px currentColor; }
+  }
+}
+
+/* ── CSS Custom Properties (Feature 8 — palette tokens) ── */
+:root {
+  --px-magenta:  #ff00cc;
+  --px-cyan:     #00ffee;
+  --px-yellow:   #ffe94a;
+  --px-green:    #4aff91;
+  --px-orange:   #ff8c1a;
+  --px-red:      #ff3355;
+  --px-hotpink:  #ff4fa3;
+  --px-dark:     #1a0a2e;
+  --px-bg:       #3d1f6e;
+  --px-bg2:      #2a1050;
+  --px-purple:   #5b3a8e;
+  --px-white:    #f0e8ff;
+
+  --card-shadow:  6px 6px 0 #000;
+  --card-border:  4px solid #000;
+  --card-shadow-sm: 3px 3px 0 #000;
 }
 
 /* ── Base styles ── */
@@ -154,7 +197,7 @@ html, body, #root {
   box-shadow: 0 0 0 #000 !important;
 }
 
-/* HP bar */
+/* HP bar — base */
 .hp-bar-track {
   width: 100%; height: 20px;
   background: #1f2937;
@@ -168,6 +211,83 @@ html, body, #root {
   animation: hpbar 1.5s ease-out forwards;
 }
 
-/* Tailwind color helpers — these are inline-used via style={} in TSX */
+/* HP bar — timer variant (drains, color shifts green→yellow→red) */
+.hp-bar-fill-timer {
+  height: 100%;
+  width: var(--fill, 100%);
+  background: linear-gradient(90deg,
+    #ff3355 0%,
+    #ff8c1a 30%,
+    #ffe94a 55%,
+    #4aff91 100%
+  );
+  background-size: 300% 100%;
+  background-position: calc(100% - var(--fill, 100%) * 2) 0;
+  transition: width var(--timer-duration, 1s) linear,
+              background-position var(--timer-duration, 1s) linear;
+}
 
+/* HP bar — risk score variant */
+.hp-bar-fill-risk {
+  height: 100%;
+  background: linear-gradient(90deg, #4aff91, #ffe94a, #ff3355);
+  animation: hpbar 1.5s ease-out forwards;
+}
 
+/* ── Feature 8: Reusable card/stat classes ── */
+.stat-card {
+  border: 4px solid #000;
+  box-shadow: var(--card-shadow);
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.pixel-card {
+  border: 4px solid #000;
+  box-shadow: var(--card-shadow);
+  padding: 1rem;
+}
+
+.trend-up   { color: #4aff91; }
+.trend-down { color: #ff3355; }
+.trend-flat { color: #ffe94a; }
+
+/* Mascot walk animation (Feature 10) */
+.mascot-walking {
+  animation: mascotWalk 1.5s ease-in-out;
+}
+
+/* Slide up reveal for new panels */
+.slide-up {
+  animation: slideUp 0.4s ease-out forwards;
+}
+
+/* Fade in */
+.fade-in {
+  animation: fadeIn 0.3s ease-out forwards;
+}
+
+/* Node-link graph styles (Feature 5) */
+.concept-node-text {
+  font-family: 'Press Start 2P', cursive;
+  font-size: 7px;
+  fill: #fff;
+}
+
+/* Tooltip for SVG chart hover (Feature 1) */
+.chart-tooltip {
+  position: absolute;
+  background: #1a0a2e;
+  border: 2px solid #00ffee;
+  box-shadow: 3px 3px 0 #000;
+  padding: 6px 10px;
+  font-family: 'Press Start 2P', cursive;
+  font-size: 8px;
+  color: #00ffee;
+  pointer-events: none;
+  white-space: nowrap;
+  z-index: 100;
+}
