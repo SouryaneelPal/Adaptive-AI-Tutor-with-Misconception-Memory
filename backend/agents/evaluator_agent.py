@@ -60,6 +60,17 @@ DEFAULT_MODEL = os.getenv("EVALUATOR_AGENT_MODEL", "gemma4:e4b")
 DEFAULT_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 DEFAULT_TEMPERATURE = float(os.getenv("EVALUATOR_AGENT_TEMPERATURE", "0.1"))
 
+# Cheating-risk speed check: local LLMs are unreliable at multi-step
+# arithmetic buried inside a structured-output call, so this one signal is
+# computed deterministically in Python (same "don't make the LLM guess at
+# something code can compute" philosophy as the orchestrator's escalation
+# gate) rather than asked of the model. A human composing new written
+# reasoning — not just typing a memorized short answer — rarely sustains
+# more than ~3 words/second; short answers are exempted since a memorized
+# number could plausibly be typed instantly either way.
+MAX_PLAUSIBLE_WORDS_PER_SECOND = 3.0
+MIN_WORDS_FOR_SPEED_CHECK = 8
+
 
 # --------------------------------------------------------------------------- #
 # Pydantic schema
@@ -125,6 +136,21 @@ class EvaluatorResult(BaseModel):
         default="",
         description="One sentence explaining the distress_detected verdict.",
     )
+    cheating_risk_detected: bool = Field(
+        default=False,
+        description=(
+            "True only when multiple suspicious signals combine: a very fast "
+            "response time for a complex problem, an answer noticeably more "
+            "sophisticated/complete than the concept calls for or than the "
+            "student's own recent responses, a sharp style mismatch vs. "
+            "recent responses, or copy-paste-shaped formatting. False for a "
+            "merely correct or confident answer on its own."
+        ),
+    )
+    cheating_risk_reasoning: str = Field(
+        default="",
+        description="One sentence explaining the cheating_risk_detected verdict.",
+    )
 
     @field_validator("answer_quality", mode="before")
     @classmethod
@@ -143,7 +169,7 @@ class EvaluatorResult(BaseModel):
         except (TypeError, ValueError):
             return 0.5
 
-    @field_validator("mastery_signal", "distress_detected", mode="before")
+    @field_validator("mastery_signal", "distress_detected", "cheating_risk_detected", mode="before")
     @classmethod
     def _coerce_bool(cls, v: Any) -> bool:
         if isinstance(v, bool):
@@ -199,6 +225,29 @@ Your outputs:
 
 7. `distress_reasoning` — 1 sentence explaining the distress_detected verdict.
 
+8. `cheating_risk_detected` — a separate deterministic typing-speed check \
+   already ran in code before this prompt (`Precomputed speed check` \
+   below) — trust it completely, don't re-derive it yourself. Your job is \
+   ONLY the style judgment:
+     Whenever `recent_student_responses` is non-empty, compare this \
+     response's vocabulary/formality/structure against them. If 2+ of the \
+     recent responses are casual/short/hesitant (things like "idk", \
+     "maybe", lowercase-only, no punctuation, under ~10 words, guesses) AND \
+     the CURRENT response uses formal textbook vocabulary the casual ones \
+     never use (e.g., "least common multiple", "equivalent fraction", \
+     numbered steps, "Step 1:") — that is a style jump. Set true.
+     Example: recent=["idk maybe 2/5?", "is it 5/6 i think", "wait how do \
+     u even do this"], current="To add fractions with unlike denominators, \
+     we determine the least common multiple..." -> style jump -> true.
+   Set true if EITHER the precomputed speed check says IMPLAUSIBLE, OR your \
+   own style judgment finds a jump as described above. If the precomputed \
+   check says "not applicable" AND `recent_student_responses` is "(none \
+   available)", you have no signal at all — default to false regardless of \
+   how polished the answer reads. Do not infer cheating from correctness, \
+   confidence, or politeness alone.
+
+9. `cheating_risk_reasoning` — 1 sentence explaining the cheating_risk_detected verdict.
+
 Respond ONLY with the structured JSON schema. No prose outside JSON.
 
 CRITICAL: Return raw JSON only — no markdown code blocks, no preamble.
@@ -215,6 +264,14 @@ Current question the student is solving:
 Student's most recent response:
 \"\"\"{student_response}\"\"\"
 
+Time taken to respond: {response_time_seconds}
+
+Precomputed speed check (already computed in code — trust this, don't \
+recompute it): {speed_check}
+
+Student's recent past responses this session, for style comparison:
+{recent_student_responses}
+
 Evaluate the response now.
 """
 
@@ -223,6 +280,36 @@ def _build_prompt(parser: PydanticOutputParser) -> ChatPromptTemplate:
     return ChatPromptTemplate.from_messages(
         [("system", _SYSTEM_PROMPT), ("human", _HUMAN_PROMPT)]
     ).partial(format_instructions=parser.get_format_instructions())
+
+
+def _compute_speed_check(
+    student_response: str, response_time_seconds: Optional[float]
+) -> tuple[str, bool]:
+    """
+    Deterministically checks whether student_response's word count is
+    humanly implausible to have been composed and typed in
+    response_time_seconds. Returns (description for the prompt, implausible).
+    """
+    if response_time_seconds is None or response_time_seconds <= 0:
+        return "not applicable (no timing data)", False
+
+    word_count = len(student_response.split())
+    if word_count < MIN_WORDS_FOR_SPEED_CHECK:
+        return (
+            f"not applicable ({word_count} words is short enough a memorized "
+            "answer could be typed instantly either way)",
+            False,
+        )
+
+    words_per_second = word_count / response_time_seconds
+    implausible = words_per_second > MAX_PLAUSIBLE_WORDS_PER_SECOND
+    verdict = "IMPLAUSIBLE" if implausible else "plausible"
+    description = (
+        f"{verdict} — {word_count} words in {response_time_seconds:.1f}s "
+        f"(~{words_per_second:.1f} words/sec; humans rarely sustain "
+        f">{MAX_PLAUSIBLE_WORDS_PER_SECOND:.0f} words/sec composing new reasoning)"
+    )
+    return description, implausible
 
 
 # --------------------------------------------------------------------------- #
@@ -256,15 +343,36 @@ class EvaluatorAgent:
         student_response: str,
         current_question: str,
         current_concept: str,
+        response_time_seconds: Optional[float] = None,
+        recent_student_responses: Optional[list[str]] = None,
     ) -> EvaluatorResult:
+        speed_description, implausible_speed = _compute_speed_check(
+            student_response, response_time_seconds
+        )
         try:
             result: EvaluatorResult = self.chain.invoke(
                 {
                     "student_response": student_response,
                     "current_question": current_question,
                     "current_concept": current_concept,
+                    "response_time_seconds": (
+                        f"{response_time_seconds:.1f} seconds"
+                        if response_time_seconds is not None
+                        else "unknown (not tracked for this turn)"
+                    ),
+                    "speed_check": speed_description,
+                    "recent_student_responses": (
+                        json.dumps(recent_student_responses)
+                        if recent_student_responses
+                        else "(none available)"
+                    ),
                 }
             )
+            if implausible_speed and not result.cheating_risk_detected:
+                result.cheating_risk_detected = True
+                result.cheating_risk_reasoning = (
+                    f"Deterministic speed check: {speed_description}."
+                )
             return result
         except Exception as exc:  # noqa: BLE001
             logger.exception("Evaluator agent failed: %s", exc)
@@ -309,6 +417,14 @@ def run_evaluator(state: dict) -> dict:
         - "mastery_signal" (bool): positive mastery evidence flag
         - "distress_detected" (bool): frustration/disengagement flag, read by
           the orchestrator's escalation gate (route_after_diagnosis)
+        - "cheating_risk_detected" (bool): suspicious-answer flag, read by the
+          same escalation gate
+
+    Also reads (both optional):
+        - "response_time_seconds" (float): wall-clock time app.py measured
+          between the tutor's last message and this student response
+        - "student_id" (str): used to fetch recent past responses (via
+          backend.memory.conversation_store) for style-mismatch comparison
     """
     student_response = state.get("student_response")
     current_question = state.get("current_question")
@@ -320,24 +436,38 @@ def run_evaluator(state: dict) -> dict:
             "and 'current_concept' in state."
         )
 
+    recent_student_responses = None
+    student_id = state.get("student_id")
+    if student_id:
+        from backend.memory.conversation_store import get_recent_messages
+
+        history = get_recent_messages(student_id, limit=10)
+        recent_student_responses = [
+            m["content"] for m in history if m.get("role") == "user"
+        ][-5:]
+
     evaluator = _get_default_evaluator()
     result = evaluator.evaluate(
         student_response=student_response,
         current_question=current_question,
         current_concept=current_concept,
+        response_time_seconds=state.get("response_time_seconds"),
+        recent_student_responses=recent_student_responses,
     )
 
     logger.info(
-        "Evaluation -> quality=%s, confidence=%.2f, mastery_signal=%s, distress=%s",
+        "Evaluation -> quality=%s, confidence=%.2f, mastery_signal=%s, distress=%s, cheating_risk=%s",
         result.answer_quality.value,
         result.confidence_score,
         result.mastery_signal,
         result.distress_detected,
+        result.cheating_risk_detected,
     )
 
     state["evaluator_result"] = result.model_dump()
     state["answer_quality"] = result.answer_quality.value
     state["distress_detected"] = result.distress_detected
+    state["cheating_risk_detected"] = result.cheating_risk_detected
     state["confidence_score"] = result.confidence_score
     state["mastery_signal"] = result.mastery_signal
     return state
@@ -384,6 +514,19 @@ if __name__ == "__main__":
             "current_question": "What is 1/2 + 1/3?",
             "current_concept": "Fraction Addition",
         },
+        {
+            "label": "Suspiciously fast + polished vs. casual history (cheating_risk_detected should be True)",
+            "student_response": (
+                "To add fractions with unlike denominators, we determine the least common "
+                "multiple of the denominators, which is 6. Converting each fraction to an "
+                "equivalent fraction with denominator 6 yields 3/6 and 2/6. Summing the "
+                "numerators gives 5/6, already in lowest terms since gcd(5, 6) = 1."
+            ),
+            "current_question": "What is 1/2 + 1/3?",
+            "current_concept": "Fraction Addition",
+            "response_time_seconds": 3.0,
+            "recent_student_responses": ["idk maybe 2/5?", "is it 5/6 i think", "wait how do u even do this"],
+        },
     ]
 
     agent = EvaluatorAgent()
@@ -393,15 +536,29 @@ if __name__ == "__main__":
         print(f"TEST: {case['label']}")
         print(f"Response: {case['student_response']!r}")
 
-        fake_state = {
-            "student_response": case["student_response"],
-            "current_question": case["current_question"],
-            "current_concept": case["current_concept"],
-        }
-
         try:
-            updated = run_evaluator(fake_state)
-            print(json.dumps(updated["evaluator_result"], indent=2))
+            if "response_time_seconds" in case or "recent_student_responses" in case:
+                # These two are normally fetched by run_evaluator() from
+                # state["response_time_seconds"] (set by app.py) and the
+                # conversation_store (via student_id) respectively — call
+                # evaluate() directly here to test them without needing a
+                # live DB-backed student history.
+                result = agent.evaluate(
+                    student_response=case["student_response"],
+                    current_question=case["current_question"],
+                    current_concept=case["current_concept"],
+                    response_time_seconds=case.get("response_time_seconds"),
+                    recent_student_responses=case.get("recent_student_responses"),
+                )
+                print(json.dumps(result.model_dump(), indent=2))
+            else:
+                fake_state = {
+                    "student_response": case["student_response"],
+                    "current_question": case["current_question"],
+                    "current_concept": case["current_concept"],
+                }
+                updated = run_evaluator(fake_state)
+                print(json.dumps(updated["evaluator_result"], indent=2))
         except Exception as e:  # noqa: BLE001
             print(f"ERROR: {e}")
 

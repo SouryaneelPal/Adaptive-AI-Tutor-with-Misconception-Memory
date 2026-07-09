@@ -26,7 +26,7 @@ and backend/agents — a missing graph must never crash a tutoring turn.
 from __future__ import annotations
 
 import logging
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from backend.memory.neo4j_client import is_available, run_query
 
@@ -118,6 +118,42 @@ def get_deep_prerequisites(concept: str) -> List[str]:
         return []
 
 
+def get_all_concepts() -> List[str]:
+    """
+    Every Concept node's name in the curriculum graph — the full node set for
+    a visualization (backend/memory/graph_viz.py). Returns [] if Neo4j is
+    unreachable or nothing has been seeded yet.
+    """
+    if not is_available():
+        return []
+
+    try:
+        rows = run_query("MATCH (c:Concept) RETURN c.name AS name")
+        return [row["name"] for row in rows]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("get_all_concepts() failed: %s", exc)
+        return []
+
+
+def get_all_edges() -> List[Tuple[str, str]]:
+    """
+    Every (concept, prerequisite) REQUIRES edge in the curriculum graph —
+    the full edge set for a visualization (backend/memory/graph_viz.py).
+    Returns [] if Neo4j is unreachable or nothing has been seeded yet.
+    """
+    if not is_available():
+        return []
+
+    try:
+        rows = run_query(
+            "MATCH (c:Concept)-[:REQUIRES]->(p:Concept) RETURN c.name AS concept, p.name AS prereq"
+        )
+        return [(row["concept"], row["prereq"]) for row in rows]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("get_all_edges() failed: %s", exc)
+        return []
+
+
 # --------------------------------------------------------------------------- #
 # Standalone test / one-time seed entry point
 # --------------------------------------------------------------------------- #
@@ -140,4 +176,7 @@ if __name__ == "__main__":
         print(f"\nConcept: {concept}")
         print(f"  direct prerequisites: {get_prerequisites(concept)}")
         print(f"  deep prerequisites:   {get_deep_prerequisites(concept)}")
+
+    print("\nAll concepts:", get_all_concepts())
+    print("All edges (concept -> prerequisite):", get_all_edges())
     print("=" * 80)

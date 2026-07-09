@@ -35,6 +35,8 @@ import logging
 from typing import Any
 
 from backend.memory.student_graph_store import save_student_profile
+from backend.memory.eval_store import record_interaction
+from backend.memory.spaced_repetition import schedule_next_review
 
 logger = logging.getLogger("student_profile")
 logging.basicConfig(level=logging.INFO)
@@ -76,6 +78,8 @@ def run_memory_update(state: dict) -> dict:
     concept_entry = profile["concept_mastery"].setdefault(
         current_concept, {"mastery": DEFAULT_MASTERY, "consecutive_misses": 0}
     )
+    mastery_before = concept_entry["mastery"]
+    consecutive_misses_before = concept_entry["consecutive_misses"]
 
     evaluator_result = state.get("evaluator_result") or {}
     diagnostic_result = state.get("diagnostic_result") or {}
@@ -107,6 +111,39 @@ def run_memory_update(state: dict) -> dict:
     student_id = state.get("student_id") or profile.get("student_id")
     if student_id:
         save_student_profile(student_id, profile)
+        schedule_next_review(student_id, current_concept, concept_entry["mastery"])
+
+        escalated = "escalation_result" in state
+        if escalated:
+            path = "escalation"
+        elif "diagnostic_result" in state:
+            path = "hint"
+        else:
+            path = "praise"
+
+        tutor_plan_result = state.get("tutor_plan_result") or {}
+        applied_strategy = tutor_plan_result.get("applied_strategy") or (
+            "escalate_to_teacher" if escalated else diagnostic_result.get("recommended_strategy")
+        )
+
+        record_interaction(
+            student_id=student_id,
+            concept=current_concept,
+            path=path,
+            mastery_signal=bool(state.get("mastery_signal")),
+            distress_detected=bool(state.get("distress_detected")),
+            cheating_risk_detected=bool(state.get("cheating_risk_detected")),
+            escalated=escalated,
+            consecutive_misses_before=consecutive_misses_before,
+            mastery_before=mastery_before,
+            mastery_after=concept_entry["mastery"],
+            answer_quality=evaluator_result.get("answer_quality"),
+            confidence_score=evaluator_result.get("confidence_score"),
+            error_type=diagnostic_result.get("error_type"),
+            identified_misconception=diagnostic_result.get("identified_misconception"),
+            applied_strategy=applied_strategy,
+            teacher_summary=state.get("teacher_summary"),
+        )
     else:
         logger.warning("No student_id in state or profile — skipping Neo4j persistence.")
 

@@ -20,11 +20,9 @@ part of this pass.
 from __future__ import annotations
 
 import logging
-import os
 from datetime import datetime, timezone
 from typing import Optional
 
-from dotenv import load_dotenv
 from sqlalchemy import (
     Column,
     DateTime,
@@ -33,25 +31,15 @@ from sqlalchemy import (
     String,
     Table,
     Text,
-    create_engine,
     select,
 )
 
-load_dotenv()
+from backend.memory.db import DATABASE_URL, get_engine
 
 logger = logging.getLogger("conversation_store")
 logging.basicConfig(level=logging.INFO)
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///backend/data/conversations.db")
-
-# SQLite needs its parent directory to exist before the file can be created.
-if DATABASE_URL.startswith("sqlite:///"):
-    _sqlite_path = DATABASE_URL.replace("sqlite:///", "", 1)
-    _parent_dir = os.path.dirname(_sqlite_path)
-    if _parent_dir:
-        os.makedirs(_parent_dir, exist_ok=True)
-
-_engine = create_engine(DATABASE_URL, future=True)
+_engine = get_engine()
 _metadata = MetaData()
 
 conversation_messages = Table(

@@ -103,6 +103,7 @@ class TutorState(TypedDict, total=False):
     current_concept: str            # Topic being taught, e.g. "Probability"
     student_response: str           # Student's latest answer text
     student_memory_profile: dict    # Mastery levels, weak prerequisites, history
+    response_time_seconds: Optional[float]  # Wall-clock time app.py measured for this reply
 
     # --- Written by evaluator_node (runs first) ---
     evaluator_result: dict          # Full EvaluatorResult as dict
@@ -110,6 +111,7 @@ class TutorState(TypedDict, total=False):
     confidence_score: float          # 0.0-1.0
     mastery_signal: bool             # True if positive mastery evidence
     distress_detected: bool          # True if frustration/disengagement language
+    cheating_risk_detected: bool     # True if the response looks suspicious (speed/style/formatting)
 
     # --- Written by diagnostic_node (conditional) ---
     diagnostic_result: dict         # Full DiagnosticResult as dict
@@ -169,11 +171,18 @@ def route_after_evaluation(state: TutorState) -> str:
     """
     After evaluator_node: skip diagnosis entirely if the answer was correct
     and the student was confident about it. Otherwise, find out why.
+
+    Exception: a cheating-flagged answer never praise-skips, even if it's
+    correct and confident — that combination (too-perfect + suspicious) is
+    exactly the highest-risk case. It still has to pass through
+    diagnostic_node first (run_escalation requires diagnostic_result in
+    state), which is where route_after_diagnosis's escalation gate lives.
     """
     answer_quality = state.get("answer_quality")
     confidence = state.get("confidence_score") or 0.0
+    cheating_risk = bool(state.get("cheating_risk_detected"))
 
-    if answer_quality == "correct" and confidence >= CONFIDENCE_THRESHOLD:
+    if answer_quality == "correct" and confidence >= CONFIDENCE_THRESHOLD and not cheating_risk:
         logger.info(
             "route -> tutor_planner (praise) [quality=%s, confidence=%.2f]",
             answer_quality,
@@ -182,9 +191,10 @@ def route_after_evaluation(state: TutorState) -> str:
         return "tutor_planner"
 
     logger.info(
-        "route -> diagnostic_node [quality=%s, confidence=%.2f]",
+        "route -> diagnostic_node [quality=%s, confidence=%.2f, cheating_risk=%s]",
         answer_quality,
         confidence,
+        cheating_risk,
     )
     return "diagnostic_node"
 
@@ -202,21 +212,27 @@ def route_after_diagnosis(state: TutorState) -> str:
     """
     The escalation gate: deterministic, no LLM call. Reads the student's
     consecutive-miss streak on this concept (from the memory profile, before
-    this turn's update) and the evaluator's distress_detected flag.
+    this turn's update), the evaluator's distress_detected flag, and the
+    evaluator's cheating_risk_detected flag — any one of the three escalates.
     """
     misses = _consecutive_misses(state)
     distress = bool(state.get("distress_detected"))
+    cheating_risk = bool(state.get("cheating_risk_detected"))
 
-    if misses >= ESCALATION_MISS_THRESHOLD or distress:
+    if misses >= ESCALATION_MISS_THRESHOLD or distress or cheating_risk:
         logger.info(
-            "route -> escalator [consecutive_misses=%d, distress=%s]", misses, distress
+            "route -> escalator [consecutive_misses=%d, distress=%s, cheating_risk=%s]",
+            misses,
+            distress,
+            cheating_risk,
         )
         return "escalator"
 
     logger.info(
-        "route -> tutor_planner (hint) [consecutive_misses=%d, distress=%s]",
+        "route -> tutor_planner (hint) [consecutive_misses=%d, distress=%s, cheating_risk=%s]",
         misses,
         distress,
+        cheating_risk,
     )
     return "tutor_planner"
 
@@ -320,6 +336,19 @@ if __name__ == "__main__":
         ],
     }
 
+    cheating_test_memory = {
+        "student_id": "stu_1024",
+        "concept_mastery": {
+            "Fraction Addition": {"mastery": 0.25, "consecutive_misses": 3},
+        },
+        "weak_prerequisites": ["Comparing Unit Fractions", "Common Denominators"],
+        "recent_attempts": [
+            {"concept": "Fraction Addition", "correct": False},
+            {"concept": "Fraction Addition", "correct": False},
+            {"concept": "Fraction Addition", "correct": False},
+        ],
+    }
+
     scenarios = [
         {
             "label": "Scenario 1 — Correct + confident (praise mode, no diagnostic)",
@@ -371,6 +400,22 @@ if __name__ == "__main__":
                 "student_memory_profile": escalation_memory,
             },
         },
+        {
+            "label": "Scenario 6 — Suspiciously fast, polished answer on a concept the student has never gotten right (cheating-risk gate)",
+            "state": {
+                "student_id": "stu_1024",
+                "current_question": "What is 1/2 + 1/3?",
+                "current_concept": "Fraction Addition",
+                "student_response": (
+                    "To add fractions with unlike denominators, we first determine the least "
+                    "common multiple of the denominators, which is 6. Converting each fraction "
+                    "to an equivalent fraction with denominator 6 yields 3/6 and 2/6. Summing "
+                    "the numerators gives 5/6, which is already in lowest terms since gcd(5, 6) = 1."
+                ),
+                "student_memory_profile": cheating_test_memory,
+                "response_time_seconds": 2.5,
+            },
+        },
     ]
 
     def _run(label: str, initial_state: dict) -> None:
@@ -387,8 +432,11 @@ if __name__ == "__main__":
                 f"\n[evaluator]   quality={ev.get('answer_quality')}  "
                 f"confidence={ev.get('confidence_score'):.2f}  "
                 f"mastery_signal={ev.get('mastery_signal')}  "
-                f"distress={ev.get('distress_detected')}"
+                f"distress={ev.get('distress_detected')}  "
+                f"cheating_risk={ev.get('cheating_risk_detected')}"
             )
+            if ev.get("cheating_risk_detected"):
+                print(f"  cheating_risk_reasoning: {ev.get('cheating_risk_reasoning')}")
 
         if "diagnostic_result" in final:
             print(

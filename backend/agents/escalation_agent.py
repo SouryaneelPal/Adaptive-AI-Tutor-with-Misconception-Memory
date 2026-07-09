@@ -139,30 +139,39 @@ class EscalationResult(BaseModel):
 _SYSTEM_PROMPT = """\
 You are the Escalation Agent inside an Adaptive AI Tutor. You are activated \
 ONLY when another agent has already decided a human teacher needs to step \
-in — usually because the student has repeatedly missed the same concept, or \
-their response shows frustration, distress, or disengagement. You do not \
-decide whether to escalate; that decision is already final. Your job is to \
-write two short pieces of text.
+in — because the student has repeatedly missed the same concept, their \
+response shows frustration/distress/disengagement, OR the response was \
+flagged as suspicious (cheating risk). You do not decide whether to \
+escalate; that decision is already final and is given to you as \
+`escalation_trigger` below. Your job is to write two short pieces of text.
 
 1. `teacher_summary` — written FOR THE TEACHER, not the student. In 2-3 \
    sentences, explain:
-   - What concept/question the student is stuck on.
-   - The core misconception or gap driving the errors (use \
-     diagnostic_result's identified_misconception / missing_prerequisite \
-     and the pattern in student_memory_profile, e.g. consecutive misses).
-   - The student's apparent frustration or confidence level, if evident from \
-     their response (e.g., "expressed frustration and disengagement" vs \
-     "calm but stuck after repeated attempts").
+   - The `escalation_trigger` given below — state the REAL reason plainly \
+     (e.g., "flagged for a suspiciously fast, polished answer inconsistent \
+     with the student's prior responses" for cheating risk; "expressed \
+     frustration and disengagement" for distress; "repeated incorrect \
+     attempts" for a miss streak). Don't blur trigger types together.
+   - What concept/question the student is working on.
+   - The core misconception or gap driving the errors, if the trigger is a \
+     miss streak or distress (use diagnostic_result's \
+     identified_misconception / missing_prerequisite and the pattern in \
+     student_memory_profile). If the trigger is cheating risk on an \
+     otherwise-correct answer, skip this — there's no error to explain.
    Be concrete and specific — avoid generic phrases like "needs more practice". \
    Write like a colleague briefing another teacher before they step in.
 
 2. `student_message` — written FOR THE STUDENT, shown directly in their chat. \
    It must:
-   - Acknowledge their effort without being condescending.
+   - For a miss-streak or distress trigger: acknowledge their effort without \
+     being condescending, warm and reassuring.
+   - For a cheating-risk trigger: stay neutral and matter-of-fact — don't \
+     accuse them, but don't praise "effort" on an answer that may not be \
+     their own either. Simply say a teacher will review this together.
    - Clearly but gently say their teacher is being looped in to help.
    - NEVER reveal or imply the answer to current_question.
    - Never sound clinical, alarming, or like it's describing them as a \
-     "problem" — keep it warm and reassuring, 1-3 sentences.
+     "problem" — keep it calm, 1-3 sentences.
 
 Respond ONLY with the structured JSON schema below. No prose outside JSON.
 
@@ -170,6 +179,9 @@ Respond ONLY with the structured JSON schema below. No prose outside JSON.
 """
 
 _HUMAN_PROMPT = """\
+Escalation trigger (the real reason this turn was escalated — reflect this \
+accurately in teacher_summary): {escalation_trigger}
+
 Current question the student is working on:
 \"\"\"{current_question}\"\"\"
 
@@ -235,6 +247,7 @@ class EscalationAgent:
         student_response: str,
         diagnostic_result: dict[str, Any],
         student_memory_profile: dict[str, Any],
+        escalation_trigger: str = "repeated incorrect attempts",
     ) -> EscalationResult:
         """
         Run escalation summary generation for a single student turn.
@@ -244,6 +257,10 @@ class EscalationAgent:
             student_response: Raw text of the student's latest answer.
             diagnostic_result: Output dict from diagnostic_agent.run_diagnostic.
             student_memory_profile: Dict of student mastery / history.
+            escalation_trigger: Plain-language reason this turn escalated
+                (cheating risk / distress / repeated misses) — computed
+                deterministically by run_escalation below, not guessed by
+                the LLM, so teacher_summary names the real cause.
 
         Returns:
             A validated EscalationResult. escalation_flag is always True.
@@ -260,6 +277,7 @@ class EscalationAgent:
                     "student_memory_profile": json.dumps(
                         student_memory_profile, indent=2
                     ),
+                    "escalation_trigger": escalation_trigger,
                 }
             )
         except Exception as exc:  # noqa: BLE001 - escalation must never crash the graph
@@ -316,6 +334,10 @@ def run_escalation(state: dict) -> dict:
         - "student_response" (str): required
         - "diagnostic_result" (dict): required, produced by run_diagnostic
         - "student_memory_profile" (dict): optional, defaults to {}
+        - "cheating_risk_detected" / "distress_detected" (bool): optional,
+          from run_evaluator — used to name the real escalation trigger
+        - "current_concept" (str): optional, used to look up consecutive
+          misses for the trigger description
 
     Keys written back into `state`:
         - "escalation_result" (dict): the full EscalationResult, JSON-serializable,
@@ -342,12 +364,26 @@ def run_escalation(state: dict) -> dict:
             "and 'diagnostic_result' to be present in state."
         )
 
+    if state.get("cheating_risk_detected"):
+        escalation_trigger = "cheating risk — suspicious answer pattern (speed/style/formatting)"
+    elif state.get("distress_detected"):
+        escalation_trigger = "student distress or disengagement language"
+    else:
+        current_concept = state.get("current_concept")
+        misses = (
+            student_memory_profile.get("concept_mastery", {})
+            .get(current_concept, {})
+            .get("consecutive_misses", 0)
+        )
+        escalation_trigger = f"repeated incorrect attempts ({misses} consecutive misses)"
+
     agent = _get_default_agent()
     result = agent.escalate(
         current_question=current_question,
         student_response=student_response,
         diagnostic_result=diagnostic_result,
         student_memory_profile=student_memory_profile,
+        escalation_trigger=escalation_trigger,
     )
 
     logger.warning(
