@@ -218,7 +218,7 @@ Student memory profile (tone calibration only):
 recommended_strategy from diagnosis: {recommended_strategy}
 evaluator answer_quality: {answer_quality}
 evaluator confidence_score: {confidence_score}
-
+{curriculum_context_block}
 Generate the tutoring response now.
 """
 
@@ -459,6 +459,7 @@ class TutorPlannerAgent:
         diagnostic_result: dict[str, Any],
         evaluator_result: dict[str, Any],
         student_memory_profile: dict[str, Any],
+        curriculum_context: str = "",
     ) -> TutorPlanResult:
         recommended_strategy = diagnostic_result.get(
             "recommended_strategy", InstructionalStrategy.SMALL_CLUE.value
@@ -478,6 +479,12 @@ class TutorPlannerAgent:
                 escalation_reason="Diagnostic agent flagged escalate_to_teacher.",
             )
 
+        curriculum_block = (
+            f"\nCURRICULUM REFERENCE (ground your hint in this material — "
+            f"do not copy verbatim):\n{curriculum_context}\n"
+            if curriculum_context else ""
+        )
+
         try:
             result: TutorPlanResult = self.chain.invoke(
                 {
@@ -490,6 +497,7 @@ class TutorPlannerAgent:
                     "recommended_strategy": recommended_strategy,
                     "answer_quality": evaluator_result.get("answer_quality", "unknown"),
                     "confidence_score": evaluator_result.get("confidence_score", 0.5),
+                    "curriculum_context_block": curriculum_block,
                 }
             )
         except Exception as exc:  # noqa: BLE001
@@ -582,6 +590,15 @@ def run_tutor_planner(state: dict) -> dict:
             student_memory_profile=student_memory_profile,
         )
     else:
+        # Retrieve curriculum context only for hint-ladder mode — praise mode
+        # doesn't benefit from it and retrieval adds latency.
+        from backend.rag.retriever import get_curriculum_context
+        curriculum_context = get_curriculum_context(
+            concept=current_concept,
+            error_type=state.get("error_type", ""),
+            misconception=(diagnostic_result or {}).get("identified_misconception", ""),
+        )
+
         result = planner.plan(
             student_response=student_response,
             current_question=current_question,
@@ -589,6 +606,7 @@ def run_tutor_planner(state: dict) -> dict:
             diagnostic_result=diagnostic_result,
             evaluator_result=evaluator_result,
             student_memory_profile=student_memory_profile,
+            curriculum_context=curriculum_context,
         )
 
     logger.info(
