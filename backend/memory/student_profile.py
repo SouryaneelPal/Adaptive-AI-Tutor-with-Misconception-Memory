@@ -20,13 +20,21 @@ Note: because evaluator_node now always runs first (see orchestrator.py),
 `evaluator_result` is always present in state by the time this node runs,
 even on the escalation branch.
 
-Tech stack: Python 3.10+, plain dict manipulation (no LLM call).
+Once the in-memory dict is updated (unchanged logic from before), this node
+also persists it to Neo4j via backend/memory/student_graph_store.py — that
+call degrades safely on its own (logs a warning, no-ops) if Neo4j isn't
+reachable, so this node's core dict-update responsibility never breaks.
+
+Tech stack: Python 3.10+, plain dict manipulation (no LLM call) + a Neo4j
+write at the end.
 """
 
 from __future__ import annotations
 
 import logging
 from typing import Any
+
+from backend.memory.student_graph_store import save_student_profile
 
 logger = logging.getLogger("student_profile")
 logging.basicConfig(level=logging.INFO)
@@ -95,6 +103,13 @@ def run_memory_update(state: dict) -> dict:
     )
 
     state["student_memory_profile"] = profile
+
+    student_id = state.get("student_id") or profile.get("student_id")
+    if student_id:
+        save_student_profile(student_id, profile)
+    else:
+        logger.warning("No student_id in state or profile — skipping Neo4j persistence.")
+
     return state
 
 

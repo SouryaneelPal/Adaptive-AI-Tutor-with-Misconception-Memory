@@ -9,3 +9,5 @@ streamlit
 sqlalchemy
 pymysql
 ollama
+neo4j
+psycopg2-binary

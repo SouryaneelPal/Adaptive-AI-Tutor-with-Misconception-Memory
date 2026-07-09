@@ -2,6 +2,9 @@ import streamlit as st
 import datetime
 
 from backend.agents.orchestrator import tutor_app
+from backend.agents.tutor_planner import run_explain
+from backend.memory.student_graph_store import load_student_profile
+from backend.memory.conversation_store import save_message, get_recent_messages
 
 # --- Page Configuration ---
 st.set_page_config(
@@ -9,6 +12,11 @@ st.set_page_config(
     page_icon="🧠",
     layout="wide",
 )
+
+# Stable identity key used for both the Neo4j mastery graph and the SQL
+# conversation transcript. A future multi-user version would derive this
+# from an actual login; for now every session is "demo_student".
+STUDENT_ID = "demo_student"
 
 # --- Lightweight styling ---
 st.markdown(
@@ -36,20 +44,29 @@ st.markdown(
 
 st.title("🧠 Adaptive AI Tutor with Misconception Memory")
 
-# --- Session State: chat ---
-if "messages" not in st.session_state:
-    st.session_state.messages = [
-        {"role": "assistant", "content": "Hi! What would you like to learn today?"}
-    ]
+DEFAULT_GREETING = [{"role": "assistant", "content": "Hi! What would you like to learn today?"}]
 
-# --- Session State: student memory profile ---
+# --- Session State: chat — hydrate from the SQL conversation store if this
+# student has prior history; otherwise fall back to the default greeting. ---
+if "messages" not in st.session_state:
+    history = get_recent_messages(STUDENT_ID)
+    st.session_state.messages = (
+        [{"role": m["role"], "content": m["content"]} for m in history]
+        if history
+        else DEFAULT_GREETING
+    )
+
+# --- Session State: student memory profile — loaded from the Neo4j mastery
+# graph (falls back to a fresh empty-shaped profile if Neo4j is unreachable
+# or this student has no data yet). ---
 if "memory_profile" not in st.session_state:
-    st.session_state.memory_profile = {
-        "student_id": "demo_student",
-        "concept_mastery": {},
-        "weak_prerequisites": [],
-        "recent_attempts": [],
-    }
+    st.session_state.memory_profile = load_student_profile(STUDENT_ID)
+
+# --- Session State: the specific problem currently being worked on. None
+# means the student's next message is a fresh question, not an answer to
+# anything — see the explain-mode branch below. ---
+if "active_question" not in st.session_state:
+    st.session_state.active_question = None
 
 # --- Session State: last turn's raw result (for internals + teacher view) ---
 if "last_final_state" not in st.session_state:
@@ -79,17 +96,19 @@ with st.sidebar:
     )
 
     if st.button("🔄 Reset session"):
-        st.session_state.messages = [
-            {"role": "assistant", "content": "Hi! What would you like to learn today?"}
-        ]
+        # Resets this browser session's view only — does not delete the
+        # student's persisted mastery graph (Neo4j) or conversation history
+        # (SQL); reloading the page will bring both back.
+        st.session_state.messages = DEFAULT_GREETING
         st.session_state.memory_profile = {
-            "student_id": "demo_student",
+            "student_id": STUDENT_ID,
             "concept_mastery": {},
             "weak_prerequisites": [],
             "recent_attempts": [],
         }
         st.session_state.last_final_state = {}
         st.session_state.escalation_log = []
+        st.session_state.active_question = None
         st.rerun()
 
     if show_internals:
@@ -99,19 +118,24 @@ with st.sidebar:
 
         last = st.session_state.last_final_state
         if last:
-            st.caption("🩺 Last evaluation")
-            st.json(last.get("evaluator_result", {}))
-            if "diagnostic_result" in last:
-                st.caption("🔍 Last diagnostic")
-                st.json(last.get("diagnostic_result", {}))
-
-            # Which path ran last turn?
-            if "escalation_result" in last:
-                path = "evaluator → diagnostic → escalator"
-            elif "diagnostic_result" in last:
-                path = "evaluator → diagnostic → tutor_planner (hint)"
+            if last.get("explain_mode"):
+                st.caption("💬 Last explanation")
+                st.json(last.get("tutor_plan_result", {}))
+                path = "explain mode (open question, no grading)"
             else:
-                path = "evaluator → tutor_planner (praise)"
+                st.caption("🩺 Last evaluation")
+                st.json(last.get("evaluator_result", {}))
+                if "diagnostic_result" in last:
+                    st.caption("🔍 Last diagnostic")
+                    st.json(last.get("diagnostic_result", {}))
+
+                # Which path ran last turn?
+                if "escalation_result" in last:
+                    path = "evaluator → diagnostic → escalator"
+                elif "diagnostic_result" in last:
+                    path = "evaluator → diagnostic → tutor_planner (hint)"
+                else:
+                    path = "evaluator → tutor_planner (praise)"
             st.caption("🧭 Agent path (last turn)")
             st.code(path, language=None)
 
@@ -167,27 +191,59 @@ with tab_student:
             with st.chat_message("user"):
                 st.markdown(prompt)
 
+        save_message(STUDENT_ID, "user", prompt, concept=current_concept)
+
         with st.spinner("Thinking..."):
             try:
-                initial_state = {
-                    "current_question": prompt,
-                    "current_concept": current_concept,
-                    "student_response": prompt,
-                    "student_memory_profile": st.session_state.memory_profile,
-                }
-                final_state = tutor_app.invoke(initial_state)
-                st.session_state.last_final_state = final_state
+                if st.session_state.active_question is None:
+                    # Nothing posed yet — this is an open question, not an
+                    # answer to grade. Explain mode skips Evaluator/Diagnostic
+                    # entirely and poses the next problem itself.
+                    result = run_explain(
+                        current_concept=current_concept,
+                        student_question=prompt,
+                        student_memory_profile=st.session_state.memory_profile,
+                    )
+                    final_state = {"explain_mode": True, **result}
+                    st.session_state.last_final_state = final_state
 
-                tutor_response = (
-                    final_state.get("hint_text")
-                    or final_state.get("teacher_summary")
-                    or "I'm not sure how to respond to that — could you rephrase?"
-                )
+                    tutor_response = result["hint_text"]
+                    if result.get("practice_question"):
+                        tutor_response += f"\n\n**Try this:** {result['practice_question']}"
+                        st.session_state.active_question = result["practice_question"]
 
-                update_memory_from_turn(final_state, current_concept, prompt)
+                else:
+                    # Answering a posed problem — run the full
+                    # evaluator -> diagnostic -> hint-ladder pipeline.
+                    initial_state = {
+                        "student_id": STUDENT_ID,
+                        "current_question": st.session_state.active_question,
+                        "current_concept": current_concept,
+                        "student_response": prompt,
+                        "student_memory_profile": st.session_state.memory_profile,
+                    }
+                    final_state = tutor_app.invoke(initial_state)
+                    st.session_state.last_final_state = final_state
+
+                    tutor_response = (
+                        final_state.get("hint_text")
+                        or final_state.get("teacher_summary")
+                        or "I'm not sure how to respond to that — could you rephrase?"
+                    )
+                    if final_state.get("practice_question"):
+                        tutor_response += f"\n\n**Try this:** {final_state['practice_question']}"
+                        st.session_state.active_question = final_state["practice_question"]
+                    # else: no new question was generated (retry_prompt / small_clue /
+                    # stronger_hint / escalation) — keep active_question as-is, so the
+                    # student's next reply is still evaluated against the SAME
+                    # problem and the hint ladder can escalate.
+
+                    update_memory_from_turn(final_state, current_concept, prompt)
 
             except Exception as exc:
                 tutor_response = f"⚠️ Tutor error: {exc}"
+
+        save_message(STUDENT_ID, "assistant", tutor_response, concept=current_concept)
 
         st.session_state.messages.append({"role": "assistant", "content": tutor_response})
         with chat_container:
@@ -197,7 +253,9 @@ with tab_student:
         # If internals are on, surface the agent path inline too
         if show_internals and st.session_state.last_final_state:
             last = st.session_state.last_final_state
-            if "escalation_result" in last:
+            if last.get("explain_mode"):
+                st.markdown('<span class="pill pill-info">Explained · new question posed</span>', unsafe_allow_html=True)
+            elif "escalation_result" in last:
                 st.markdown('<span class="pill pill-warn">Escalated to teacher</span>', unsafe_allow_html=True)
             elif "diagnostic_result" in last:
                 q = last.get("evaluator_result", {}).get("answer_quality", "?")

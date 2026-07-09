@@ -43,6 +43,8 @@ import os
 from enum import Enum
 from typing import Any, Optional
 
+from backend.memory.misconception_graph import get_prerequisites
+
 from dotenv import load_dotenv
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -186,7 +188,10 @@ Classification rules (apply in this order):
    concept alone, because it depends on a more foundational skill the \
    student has not mastered (check student_memory_profile's weak/low-mastery \
    prerequisites, and infer new ones from the response if needed). \
-   Set missing_prerequisite to the name of that foundational skill. \
+   If `known_prerequisites` below lists any candidates, PREFER naming one of \
+   them verbatim in missing_prerequisite when it genuinely fits the gap — \
+   this keeps prerequisite names consistent across turns. Only name \
+   something not on that list if none of the known ones explain the error. \
    recommended_strategy="prerequisite_review".
 
 Be conservative: only claim CONCEPTUAL or PREREQUISITE if the response gives \
@@ -201,6 +206,10 @@ any extra commentary outside the schema fields.
 
 _HUMAN_PROMPT = """\
 Current concept being taught: {current_concept}
+
+Known prerequisites for this concept, from the curriculum graph (prefer \
+naming one of these verbatim as missing_prerequisite when it fits — see \
+rule 4): {known_prerequisites}
 
 Student's memory profile (mastery levels, known weak prerequisites, and \
 recent history for this concept):
@@ -280,14 +289,22 @@ class DiagnosticAgent:
             evaluator_result: The Evaluator Agent's quality/confidence verdict
                 for this same response (already computed upstream).
 
+        Internally fetches known_prerequisites for current_concept from the
+        Neo4j-backed curriculum graph (backend/memory/misconception_graph.py)
+        to ground missing_prerequisite in a consistent vocabulary. Returns []
+        (not an error) if Neo4j isn't reachable or the concept isn't mapped.
+
         Returns:
             A validated DiagnosticResult.
         """
+        known_prerequisites = get_prerequisites(current_concept)
+
         try:
             result: DiagnosticResult = self.chain.invoke(
                 {
                     "student_response": student_response,
                     "current_concept": current_concept,
+                    "known_prerequisites": json.dumps(known_prerequisites),
                     "student_memory_profile": json.dumps(
                         student_memory_profile, indent=2
                     ),

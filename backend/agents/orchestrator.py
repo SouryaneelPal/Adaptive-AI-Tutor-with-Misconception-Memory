@@ -98,6 +98,7 @@ class TutorState(TypedDict, total=False):
     """
 
     # --- Provided by caller at turn start ---
+    student_id: str                 # Identity key for Neo4j/conversation persistence
     current_question: str           # The problem the student is solving
     current_concept: str            # Topic being taught, e.g. "Probability"
     student_response: str           # Student's latest answer text
@@ -323,6 +324,7 @@ if __name__ == "__main__":
         {
             "label": "Scenario 1 — Correct + confident (praise mode, no diagnostic)",
             "state": {
+                "student_id": "stu_1024",
                 "current_question": "What is 1/2 + 1/3?",
                 "current_concept": "Fraction Addition",
                 "student_response": "1/2 + 1/3 = 3/6 + 2/6 = 5/6.",
@@ -332,6 +334,7 @@ if __name__ == "__main__":
         {
             "label": "Scenario 2 — Conceptual error (evaluator -> diagnostic -> tutor_planner hint)",
             "state": {
+                "student_id": "stu_1024",
                 "current_question": "What is 1/2 + 1/3?",
                 "current_concept": "Fraction Addition",
                 "student_response": "1/2 + 1/3 = 2/5 because you add the tops and bottoms.",
@@ -341,6 +344,7 @@ if __name__ == "__main__":
         {
             "label": "Scenario 3 — Correct but low confidence (evaluator sends to diagnostic; planner should strengthen)",
             "state": {
+                "student_id": "stu_1024",
                 "current_question": "What is 1/2 + 1/3?",
                 "current_concept": "Fraction Addition",
                 "student_response": "Maybe 5/6? I think I need a common denominator but I'm not sure.",
@@ -350,6 +354,7 @@ if __name__ == "__main__":
         {
             "label": "Scenario 4 — Careless slip",
             "state": {
+                "student_id": "stu_1024",
                 "current_question": "What is 1/4 + 1/4?",
                 "current_concept": "Fraction Addition",
                 "student_response": "1/4 + 1/4 = 2/8.",
@@ -359,6 +364,7 @@ if __name__ == "__main__":
         {
             "label": "Scenario 5 — Persistent failure + distress -> escalation gate fires",
             "state": {
+                "student_id": "stu_1024",
                 "current_question": "What is 1/2 + 1/3?",
                 "current_concept": "Fraction Addition",
                 "student_response": "I give up, I hate fractions, this is impossible.",

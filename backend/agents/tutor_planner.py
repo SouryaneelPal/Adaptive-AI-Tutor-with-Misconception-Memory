@@ -5,8 +5,7 @@ Tutor Planner Agent for the Adaptive AI Tutor with Misconception Memory.
 
 Role
 ====
-This agent has two distinct entry points, both reached via
-orchestrator.py's routers:
+This agent has three distinct entry points:
 
   1. PRAISE MODE (plan_praise) — reached directly from route_after_evaluation
      when the Evaluator scored the response correct + confident (>= 0.6). No
@@ -18,8 +17,17 @@ orchestrator.py's routers:
      BOTH its error classification and the Evaluator's quality/confidence
      assessment to calibrate a hint response.
 
-run_tutor_planner (the LangGraph node) branches between the two based on
-whether "diagnostic_result" is present in state.
+  3. EXPLAIN MODE (plan_explain) — called directly by app.py (NOT part of
+     the orchestrator.py graph, no Evaluator/Diagnostic involved) when the
+     student has asked an open conceptual question rather than answered a
+     posed problem. There's nothing to grade yet, so this mode just
+     explains clearly and ends with one comprehension-check question,
+     which app.py then tracks as the next "active_question" to evaluate an
+     answer against.
+
+run_tutor_planner (the LangGraph node) branches between modes 1 and 2 based
+on whether "diagnostic_result" is present in state. Mode 3 is invoked via
+the separate run_explain(...) module function, outside the graph entirely.
 
 Hard pedagogical rule: NEVER reveal the direct final answer to current_question.
 
@@ -278,6 +286,58 @@ def _build_praise_prompt(parser: PydanticOutputParser) -> ChatPromptTemplate:
 
 
 # --------------------------------------------------------------------------- #
+# Explain-mode prompt template (open question, no posed problem to grade)
+# --------------------------------------------------------------------------- #
+
+_EXPLAIN_SYSTEM_PROMPT = """\
+You are the Tutor Planner Agent inside an Adaptive AI Tutor. The student has \
+asked an open conceptual question — they are NOT answering a problem you \
+posed, so there is nothing to grade here. No Evaluator or Diagnostic Agent \
+has run on this turn.
+
+Produce:
+
+- `hint_text`: A clear, simple answer to the student's question, using a \
+  concrete example (e.g. splitting objects into pieces) to make the idea \
+  intuitive. Unlike hint-ladder mode, you SHOULD explain the concept here — \
+  that's the point of this mode. Keep it warm and at most a few sentences; \
+  don't over-explain.
+- `applied_strategy`: always "none".
+- `practice_question`: REQUIRED (never null). One comprehension-check \
+  question that tests whether the student now grasps the idea you just \
+  explained — a small, concrete, answerable question, not a restatement of \
+  their original question. This becomes the next problem they work on.
+- `escalation_flag`: always false.
+
+Use `student_memory_profile` for tone only (never mention it explicitly).
+
+Respond ONLY with the structured JSON schema. No prose outside JSON.
+
+CRITICAL: Return raw JSON only — no markdown code blocks, no preamble.
+
+{format_instructions}
+"""
+
+_EXPLAIN_HUMAN_PROMPT = """\
+Current concept being taught: {current_concept}
+
+Student's question:
+\"\"\"{student_question}\"\"\"
+
+Student memory profile (tone calibration only):
+{student_memory_profile}
+
+Generate the explanation + comprehension-check question now.
+"""
+
+
+def _build_explain_prompt(parser: PydanticOutputParser) -> ChatPromptTemplate:
+    return ChatPromptTemplate.from_messages(
+        [("system", _EXPLAIN_SYSTEM_PROMPT), ("human", _EXPLAIN_HUMAN_PROMPT)]
+    ).partial(format_instructions=parser.get_format_instructions())
+
+
+# --------------------------------------------------------------------------- #
 # Answer-leak guard
 # --------------------------------------------------------------------------- #
 
@@ -309,6 +369,7 @@ class TutorPlannerAgent:
         self.parser = PydanticOutputParser(pydantic_object=TutorPlanResult)
         self.prompt = _build_prompt(self.parser)
         self.praise_prompt = _build_praise_prompt(self.parser)
+        self.explain_prompt = _build_explain_prompt(self.parser)
         self.llm = ChatOllama(
             model=model,
             base_url=base_url,
@@ -317,6 +378,41 @@ class TutorPlannerAgent:
         )
         self.chain = self.prompt | self.llm | self.parser
         self.praise_chain = self.praise_prompt | self.llm | self.parser
+        self.explain_chain = self.explain_prompt | self.llm | self.parser
+
+    def plan_explain(
+        self,
+        student_question: str,
+        current_concept: str,
+        student_memory_profile: dict[str, Any],
+    ) -> TutorPlanResult:
+        """
+        Explain-mode planning: the student asked an open conceptual question,
+        not an answer to a posed problem. No Evaluator/Diagnostic input is
+        available or needed. Produces a clear explanation plus a required
+        comprehension-check practice_question.
+        """
+        try:
+            result: TutorPlanResult = self.explain_chain.invoke(
+                {
+                    "student_question": student_question,
+                    "current_concept": current_concept,
+                    "student_memory_profile": json.dumps(student_memory_profile, indent=2),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Tutor planner (explain mode) failed: %s", exc)
+            return TutorPlanResult(
+                hint_text="That's a great question — let's think it through together.",
+                applied_strategy=InstructionalStrategy.NONE,
+                practice_question=f"What do you already know about {current_concept}?",
+                escalation_flag=False,
+            )
+
+        if not result.practice_question:
+            logger.warning("Explain-mode planner did not produce a practice_question.")
+
+        return result
 
     def plan_praise(
         self,
@@ -510,6 +606,42 @@ def run_tutor_planner(state: dict) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Explain-mode entry point (called directly by app.py, NOT part of the
+# orchestrator.py graph — there's no problem posed yet to run
+# evaluator/diagnostic against)
+# --------------------------------------------------------------------------- #
+
+def run_explain(current_concept: str, student_question: str, student_memory_profile: dict) -> dict:
+    """
+    Standalone entry point for explain mode. Mirrors the shape of the other
+    run_*(state) functions for consistency, but takes plain arguments and
+    returns a plain dict (not a LangGraph state) since it isn't a graph node.
+
+    Returns a dict with:
+        - "tutor_plan_result" (dict): full TutorPlanResult
+        - "hint_text" (str): the student-facing explanation
+        - "practice_question" (str): the required comprehension-check question
+    """
+    planner = _get_default_planner()
+    result = planner.plan_explain(
+        student_question=student_question,
+        current_concept=current_concept,
+        student_memory_profile=student_memory_profile or {},
+    )
+
+    logger.info(
+        "Explain mode -> has_practice_q=%s",
+        result.practice_question is not None,
+    )
+
+    return {
+        "tutor_plan_result": result.model_dump(),
+        "hint_text": result.hint_text,
+        "practice_question": result.practice_question,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Standalone test
 # --------------------------------------------------------------------------- #
 
@@ -608,5 +740,20 @@ if __name__ == "__main__":
                 print(f"\npractice_question: {updated['practice_question']}")
         except Exception as e:  # noqa: BLE001
             print(f"ERROR: {e}")
+
+    print("=" * 80)
+    print("TEST: Explain mode (open question, no posed problem)")
+    print("Question: 'Why is 1/2 bigger than 1/3?'")
+    try:
+        explained = run_explain(
+            current_concept="Fraction Addition",
+            student_question="Why is 1/2 bigger than 1/3?",
+            student_memory_profile=mock_memory,
+        )
+        print(json.dumps(explained["tutor_plan_result"], indent=2))
+        print(f"\nhint_text:\n{explained['hint_text']}")
+        print(f"\npractice_question: {explained['practice_question']}")
+    except Exception as e:  # noqa: BLE001
+        print(f"ERROR: {e}")
 
     print("=" * 80)
