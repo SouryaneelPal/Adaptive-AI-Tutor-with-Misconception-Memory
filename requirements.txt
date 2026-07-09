@@ -5,8 +5,7 @@ langchain-core
 langchain-ollama
 langchain-community
 langchain-text-splitters
-chromadb
-langchain-chroma
+faiss-cpu
 python-dotenv
 pydantic
 streamlit

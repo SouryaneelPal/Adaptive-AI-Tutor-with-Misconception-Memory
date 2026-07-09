@@ -69,6 +69,3 @@ Thumbs.db
 
 # Streamlit (for Phase A)
 .streamlit/secrets.toml
-
-# ChromaDB persisted index (generated, rebuild with reset_index())
-backend/rag/.chromadb/
