@@ -28,13 +28,13 @@ def check(label, fn):
 # ── 1. Dependencies ────────────────────────────────────────────────────────────
 print("\n=== 1. Dependencies ===")
 
-def _check_faiss():
-    import faiss  # noqa: F401
-    return f"faiss version: {faiss.__version__}"
+def _check_chromadb():
+    import chromadb  # noqa: F401
+    return f"chromadb version: {chromadb.__version__}"
 
-def _check_langchain_community():
-    from langchain_community.vectorstores import FAISS  # noqa: F401
-    return "langchain_community.vectorstores.FAISS importable"
+def _check_langchain_chroma():
+    from langchain_chroma import Chroma  # noqa: F401
+    return "langchain_chroma.Chroma importable"
 
 def _check_text_splitters():
     from langchain_text_splitters import MarkdownHeaderTextSplitter  # noqa: F401
@@ -44,8 +44,8 @@ def _check_ollama_embeddings():
     from langchain_ollama import OllamaEmbeddings  # noqa: F401
     return "OllamaEmbeddings importable"
 
-check("faiss-cpu", _check_faiss)
-check("langchain-community FAISS", _check_langchain_community)
+check("chromadb", _check_chromadb)
+check("langchain-chroma", _check_langchain_chroma)
 check("langchain-text-splitters", _check_text_splitters)
 check("langchain-ollama embeddings", _check_ollama_embeddings)
 
@@ -117,17 +117,17 @@ def _check_embed_model():
 check(f"embed model ({os.getenv('EMBED_MODEL', 'nomic-embed-text')})", _check_embed_model)
 
 
-# ── 6. FAISS index build ───────────────────────────────────────────────────────
-print("\n=== 6. FAISS index build ===")
+# ── 6. ChromaDB index build ────────────────────────────────────────────────────
+print("\n=== 6. ChromaDB index build ===")
 
 def _check_index_build():
-    # Reset singleton so we always rebuild fresh in this test
     import backend.rag.indexer as idx_mod
     idx_mod._index = None
     index = idx_mod.get_index()
-    return f"Index built: {index.index.ntotal} vectors"
+    count = index._collection.count()
+    return f"Index loaded: {count} vectors"
 
-check("get_index() (builds FAISS)", _check_index_build)
+check("get_index() (ChromaDB)", _check_index_build)
 
 
 # ── 7. Retrieval ───────────────────────────────────────────────────────────────
